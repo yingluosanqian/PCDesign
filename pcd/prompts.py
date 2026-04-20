@@ -233,9 +233,38 @@ Your job:
 1. MERGE duplicate or near-duplicate issues across critics into a
    single cluster. Duplicates are issues pointing at the same root
    problem, even if worded differently.
-2. CALIBRATE severity. The critics often inflate. Lower severity when
+2. ASSIGN a primary responsibility when issues from two or three
+   critics point at the same root problem. Use the
+   "primary-failure-consequence" rule:
+   - If the primary consequence is "the user's requirement or the
+     comparison obligation against the reference implementation is
+     misrepresented", the primary section is `requirement`.
+   - If the primary consequence is "the workflow cannot run, cannot
+     stop reliably, or its complexity is mismatched with the goal",
+     the primary section is `solution`.
+   - If the primary consequence is "the stated conclusion does not
+     follow from the premises / the first-principles derivation has
+     leaps or hidden assumptions", the primary section is `rationale`.
+   Secondary critics' views are folded into `evidence_summary` and may
+   shift severity, but MUST NOT spawn a second cluster.
+   Worked examples:
+   - "Stop rule is unsound" → if the rule is unexecutable, primary is
+     `solution`; if it is executable but the doc claims it *proves*
+     convergence without justification, primary is `rationale`.
+   - "No baseline comparison against the reference implementation" →
+     if this makes the user's 'better-than' obligation un-judgeable,
+     primary is `requirement`; if the doc already claims 'better
+     tradeoff' without supporting it, primary is `rationale`.
+   - "Risk is not in the evaluation criteria" → if the workflow
+     therefore lacks a needed control step, primary is `solution`;
+     if the doc concludes 'this is the preferred choice' without
+     folding risk into its argument, primary is `rationale`.
+3. CALIBRATE severity. The critics often inflate. Lower severity when
    evidence is weak; raise it when the issue clearly blocks the design.
-3. DECIDE an action for each cluster:
+   If the highest severity only comes from a secondary-responsibility
+   view while the primary-responsibility view rates it lower, you MAY
+   drop by one level — but note the reason in `rationale`.
+4. DECIDE an action for each cluster:
    - `must_fix`  — a clear defect the Proposer should address now.
    - `should_fix` — worth fixing, but not blocking.
    - `reject`    — not a real problem, out of scope, or wrong.

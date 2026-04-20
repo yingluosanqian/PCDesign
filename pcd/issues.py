@@ -157,13 +157,57 @@ def _summarize(package: Iterable[dict]) -> dict:
 
 
 def is_converged(judgment: dict) -> bool:
-    """v1 convergence rule: no must_fix, ≤2 should_fix, no actionable high."""
+    """Single-round quality-suppression check: no must_fix, ≤2 should_fix, no actionable high.
+
+    NOTE: this is one of the two signals the orchestrator requires for
+    declaring overall convergence. The other is `is_stable` (must_fix
+    did not rebound vs the previous round). Callers that want the
+    combined signal should `and` both together.
+    """
     s = judgment.get("summary") or {}
     return (
         s.get("must_fix_count", 1) == 0
         and s.get("should_fix_count", 99) <= 2
         and s.get("high_severity_count", 1) == 0
     )
+
+
+def must_fix_count(judgment: dict | None) -> int | None:
+    """Return the must_fix count for a judgment, or None if not extractable."""
+    if not isinstance(judgment, dict):
+        return None
+    s = judgment.get("summary") or {}
+    v = s.get("must_fix_count")
+    return v if isinstance(v, int) else None
+
+
+def is_stable(
+    prev_judgment: dict | None, curr_judgment: dict
+) -> bool:
+    """Stability signal: must_fix count did not rebound from prev to current.
+
+    A stable round requires a prior round to compare against, and the
+    current round's must_fix count must be <= the previous round's
+    (no rebound). First rounds are never stable.
+    """
+    prev_mf = must_fix_count(prev_judgment)
+    curr_mf = must_fix_count(curr_judgment)
+    if prev_mf is None or curr_mf is None:
+        return False
+    return prev_mf >= curr_mf
+
+
+def no_progress(must_fix_history: list[int]) -> bool:
+    """Detect "stuck" runs: must_fix non-decreasing across the last 2 transitions.
+
+    Needs at least 3 data points. Returns True iff the last three
+    must_fix counts satisfy h[-1] >= h[-2] >= h[-3] and h[-1] > 0.
+    When True, the orchestrator halts and recommends human check.
+    """
+    if len(must_fix_history) < 3:
+        return False
+    a, b, c = must_fix_history[-3], must_fix_history[-2], must_fix_history[-1]
+    return c >= b and b >= a and c > 0
 
 
 def format_issue_package_for_proposer(judgment: dict) -> str:

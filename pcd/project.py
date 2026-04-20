@@ -14,6 +14,7 @@ META_FILENAME = "meta.json"
 INITIAL_PROMPT_FILENAME = "initial_prompt.txt"
 JUDGMENTS_LOG = "judgments.jsonl"
 REVISIONS_LOG = "revisions.jsonl"
+HUMAN_CHECKS_LOG = "human_checks.jsonl"
 
 
 @dataclass
@@ -47,6 +48,7 @@ class Project:
         self.initial_prompt_path = self.meta_dir / INITIAL_PROMPT_FILENAME
         self.judgments_log_path = self.meta_dir / JUDGMENTS_LOG
         self.revisions_log_path = self.meta_dir / REVISIONS_LOG
+        self.human_checks_log_path = self.meta_dir / HUMAN_CHECKS_LOG
 
     def exists(self) -> bool:
         return self.meta_path.exists()
@@ -68,14 +70,40 @@ class Project:
         iteration: int,
         judgment: dict,
         critics_output: dict,
+        manually_edited: bool = False,
     ) -> None:
         record = {
             "iteration": iteration,
             "timestamp": self.now_iso(),
             "critics_output": critics_output,
             "judgment": judgment,
+            "manually_edited": manually_edited,
         }
         self._append_jsonl(self.judgments_log_path, record)
+
+    def append_human_check(self, record: dict) -> None:
+        self._append_jsonl(self.human_checks_log_path, record)
+
+    def next_human_check_id(self) -> int:
+        if not self.human_checks_log_path.exists():
+            return 1
+        count = 0
+        with self.human_checks_log_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+        return count + 1
+
+    def must_fix_history(self) -> list[int]:
+        """must_fix counts across all logged iterations, in order."""
+        out: list[int] = []
+        for rec in self.iter_judgments():
+            j = rec.get("judgment") or {}
+            s = j.get("summary") or {}
+            mf = s.get("must_fix_count")
+            if isinstance(mf, int):
+                out.append(mf)
+        return out
 
     def append_revision(self, *, iteration: int, note: str = "") -> None:
         record = {
