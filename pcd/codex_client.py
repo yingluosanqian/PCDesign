@@ -1,21 +1,33 @@
 """Minimal JSON-RPC client for `codex app-server --listen stdio://`.
 
-Spawns a subprocess, initializes the protocol, and exposes:
-  - start_thread / resume_thread (session persistence via thread_id)
-  - run_turn (blocks until turn/completed, returns the final_answer text)
+Design notes
+------------
+We run codex as a subprocess and speak newline-delimited JSON-RPC over its
+stdio. Two background reader threads drain stdout/stderr line-by-line into
+queues, and the main thread pulls from the stdout queue with a timeout.
 
-Designed for single-shot CLI use — no transport caching, no warmup.
+Why threads + queues and not select(): codex closes stderr (or simply stops
+writing to it) after its startup warnings, and when that happens select()
+reports stderr as permanently ready (EOF is "ready"), while readline()
+returns immediately with "". That spins the CPU. Separately, TextIOWrapper
+has an internal buffer that select() doesn't see, so select can falsely
+report "not ready" while a full JSON line is already buffered in Python.
+Per-stream reader threads using blocking readline() avoid both pitfalls.
 """
 from __future__ import annotations
 
 import json
 import os
-import select
+import queue
 import shutil
 import subprocess
 from dataclasses import dataclass
+from threading import Thread
 from time import monotonic
-from typing import Callable, Optional
+from typing import Callable, IO, Optional
+
+
+_EOF = object()  # sentinel put on the queue when a reader thread hits EOF
 
 
 @dataclass
@@ -38,6 +50,12 @@ class CodexClient:
         self._reasoning_effort = reasoning_effort
         self._timeout_seconds = timeout_seconds
         self._process: Optional[subprocess.Popen[str]] = None
+        self._stdout_queue: "queue.Queue[object]" = queue.Queue()
+        self._stderr_queue: "queue.Queue[object]" = queue.Queue()
+        self._stdout_thread: Optional[Thread] = None
+        self._stderr_thread: Optional[Thread] = None
+        self._stdout_eof = False
+        self._stderr_eof = False
         self._next_id = 1
         self._pending_notifications: list[dict] = []
         self._stderr_buffer: list[str] = []
@@ -69,6 +87,21 @@ class CodexClient:
             cwd=self._cwd,
             env=os.environ.copy(),
         )
+        assert self._process.stdout is not None and self._process.stderr is not None
+        self._stdout_thread = Thread(
+            target=self._reader_loop,
+            args=(self._process.stdout, self._stdout_queue),
+            daemon=True,
+            name="codex-stdout",
+        )
+        self._stderr_thread = Thread(
+            target=self._reader_loop,
+            args=(self._process.stderr, self._stderr_queue),
+            daemon=True,
+            name="codex-stderr",
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
         self._request(
             "initialize",
             {
@@ -92,6 +125,10 @@ class CodexClient:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
+        # Reader threads will hit EOF once streams close and exit naturally.
+        for t in (self._stdout_thread, self._stderr_thread):
+            if t is not None:
+                t.join(timeout=2)
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             try:
                 if stream is not None:
@@ -172,14 +209,11 @@ class CodexClient:
                 )
             msg = self._read_message(deadline=deadline)
             if msg is None:
-                proc = self._process
-                if proc is None or proc.poll() is not None:
-                    raise RuntimeError(
-                        self._failure_detail(
-                            "codex app-server exited before turn/completed"
-                        )
+                raise RuntimeError(
+                    self._failure_detail(
+                        "codex app-server exited before turn/completed"
                     )
-                continue
+                )
             if "method" not in msg:
                 continue
             method = str(msg["method"])
@@ -219,6 +253,19 @@ class CodexClient:
             thread_id=thread_id,
         )
 
+    # ------------------------------------------------------------------ plumbing
+
+    @staticmethod
+    def _reader_loop(stream: IO[str], q: "queue.Queue[object]") -> None:
+        try:
+            while True:
+                line = stream.readline()
+                if not line:
+                    break
+                q.put(line)
+        finally:
+            q.put(_EOF)
+
     def _request(self, method: str, params: dict) -> dict:
         proc = self._process
         if proc is None or proc.stdin is None:
@@ -230,7 +277,9 @@ class CodexClient:
         proc.stdin.flush()
         deadline = monotonic() + self._timeout_seconds
         while True:
-            msg = self._read_message(deadline=deadline)
+            # Always read fresh here: reading from the pending-notifications
+            # buffer would create a self-feeding loop (pop, re-enqueue, pop…).
+            msg = self._read_fresh_message(deadline=deadline)
             if msg is None:
                 raise RuntimeError(
                     self._failure_detail(
@@ -251,35 +300,52 @@ class CodexClient:
     def _read_message(self, *, deadline: float) -> Optional[dict]:
         if self._pending_notifications:
             return self._pending_notifications.pop(0)
-        proc = self._process
-        if proc is None or proc.stdout is None or proc.stderr is None:
-            return None
+        return self._read_fresh_message(deadline=deadline)
+
+    def _read_fresh_message(self, *, deadline: float) -> Optional[dict]:
+        self._drain_stderr()
         while True:
             remaining = max(0.0, deadline - monotonic())
             if remaining == 0.0:
                 return None
-            ready, _, _ = select.select(
-                [proc.stdout, proc.stderr], [], [], min(0.25, remaining)
-            )
-            if not ready:
-                if proc.poll() is not None:
+            try:
+                item = self._stdout_queue.get(timeout=min(0.25, remaining))
+            except queue.Empty:
+                self._drain_stderr()
+                if self._stdout_eof:
                     return None
+                proc = self._process
+                if proc is not None and proc.poll() is not None:
+                    # Process exited and we've already drained what we could.
+                    try:
+                        item = self._stdout_queue.get_nowait()
+                    except queue.Empty:
+                        return None
+                else:
+                    continue
+            if item is _EOF:
+                self._stdout_eof = True
+                return None
+            line = str(item).strip()
+            if not line:
                 continue
-            for stream in ready:
-                line = stream.readline()
-                if not line:
-                    continue
-                if stream is proc.stderr:
-                    self._stderr_buffer.append(line)
-                    continue
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    return json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+    def _drain_stderr(self) -> None:
+        while True:
+            try:
+                item = self._stderr_queue.get_nowait()
+            except queue.Empty:
+                return
+            if item is _EOF:
+                self._stderr_eof = True
+                return
+            self._stderr_buffer.append(str(item))
 
     def _failure_detail(self, default: str) -> str:
+        self._drain_stderr()
         stderr = "".join(self._stderr_buffer).strip()
         return stderr or default
