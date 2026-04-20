@@ -38,11 +38,11 @@ def run_proposer_revise(
     *,
     project_root: Path,
     thread_id: str,
-    critique: str,
+    issue_package_markdown: str,
     model: Optional[str],
     reasoning_effort: str = "medium",
 ) -> None:
-    """Resume P's long session, apply critique, rewrite design.md in place."""
+    """Resume P's long session, apply the Judge's issue package, rewrite design.md."""
     with CodexClient(
         cwd=str(project_root),
         reasoning_effort=reasoning_effort,
@@ -57,5 +57,5 @@ def run_proposer_revise(
             thread_id=thread_id,
             cwd=str(project_root),
             model=model,
-            prompt=proposer_revise_prompt(critique),
+            prompt=proposer_revise_prompt(issue_package_markdown),
         )
