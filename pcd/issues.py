@@ -102,12 +102,15 @@ def parse_critic_issues(role: str, text: str) -> list[dict]:
     return issues
 
 
-def parse_reframer_output(text: str) -> tuple[list[str], list[dict]]:
+def parse_reframer_output(text: str) -> dict:
     """Normalize a Reframer's raw response.
 
-    Returns `(hard_constraints, alternatives)` where hard_constraints
-    is the Reframer's enumeration of constraints from initial_prompt,
-    and alternatives is a list of alt dicts.
+    Returns a dict with:
+    - `hard_constraints`: list[str] of constraints extracted from initial_prompt
+    - `brainstorm_sketches`: list[dict] of phase-2 rough sketches
+      (terse: sketch_id / one_line / lens / flavor)
+    - `meta_reflection`: dict capturing phase-3 self-audit
+    - `alternatives`: list[dict] of formalized phase-4 alts
     """
     data = extract_json(text)
     if not isinstance(data, dict):
@@ -117,6 +120,33 @@ def parse_reframer_output(text: str) -> tuple[list[str], list[dict]]:
     if not isinstance(raw_constraints, list):
         raw_constraints = []
     constraints: list[str] = [str(c) for c in raw_constraints if c]
+
+    raw_brainstorm = data.get("brainstorm_sketches") or []
+    brainstorm: list[dict] = []
+    if isinstance(raw_brainstorm, list):
+        for i, b in enumerate(raw_brainstorm):
+            if not isinstance(b, dict):
+                continue
+            brainstorm.append(
+                {
+                    "sketch_id": str(b.get("sketch_id") or f"b{i+1}"),
+                    "one_line": str(b.get("one_line") or ""),
+                    "lens": str(b.get("lens") or ""),
+                    "flavor": str(b.get("flavor") or ""),
+                }
+            )
+
+    raw_meta = data.get("meta_reflection") or {}
+    meta_reflection: dict = {}
+    if isinstance(raw_meta, dict):
+        for k in (
+            "rearrangement_fraction",
+            "default_inheritance_i_initially_missed",
+            "additive_axis_covered",
+            "subtractive_axis_covered",
+        ):
+            if k in raw_meta:
+                meta_reflection[k] = raw_meta[k]
 
     raw_alts = data.get("alternatives")
     if not isinstance(raw_alts, list):
@@ -143,6 +173,7 @@ def parse_reframer_output(text: str) -> tuple[list[str], list[dict]]:
                 )
         entry: dict = {
             "id": str(raw.get("id") or f"alt-{i+1}"),
+            "from_sketch": str(raw.get("from_sketch") or ""),
             "cognitive_move": move,
             "one_line": str(raw.get("one_line") or "unspecified"),
             "key_invariant": str(raw.get("key_invariant") or ""),
@@ -153,7 +184,13 @@ def parse_reframer_output(text: str) -> tuple[list[str], list[dict]]:
         if move != move_raw:
             entry["invalid_cognitive_move_raw"] = move_raw
         alts.append(entry)
-    return constraints, alts
+
+    return {
+        "hard_constraints": constraints,
+        "brainstorm_sketches": brainstorm,
+        "meta_reflection": meta_reflection,
+        "alternatives": alts,
+    }
 
 
 def alternatives_to_issues(
@@ -215,20 +252,16 @@ def alternatives_to_issues(
 def format_alternatives_summary(
     alternatives: list[dict],
     hard_constraints: list[str] | None = None,
+    *,
+    brainstorm_sketches: list[dict] | None = None,
+    meta_reflection: dict | None = None,
 ) -> str:
     """Render a Reframer package as a standalone markdown summary for
-    rounds/iter_NNN/alternatives.md."""
+    rounds/iter_NNN/alternatives.md. Includes the phase-2 brainstorm
+    sketches and phase-3 meta_reflection for audit."""
     hc = hard_constraints or []
-    if not alternatives:
-        body = "_No alternatives produced this round._\n"
-        if hc:
-            body = (
-                "## Reframer-extracted hard constraints\n\n"
-                + "\n".join(f"- {c}" for c in hc)
-                + "\n\n"
-                + body
-            )
-        return body
+    bs = brainstorm_sketches or []
+    mr = meta_reflection or {}
 
     lines: list[str] = []
     if hc:
@@ -238,7 +271,30 @@ def format_alternatives_summary(
             lines.append(f"- {c}")
         lines.append("")
 
-    lines.append(f"# Reframer alternatives ({len(alternatives)})")
+    if bs:
+        lines.append(f"## Phase 2 — brainstorm ({len(bs)} sketches)")
+        lines.append("")
+        for b in bs:
+            sid = b.get("sketch_id", "?")
+            one = b.get("one_line", "")
+            lens = b.get("lens", "")
+            flavor = b.get("flavor", "")
+            line = f"- **`{sid}`** ({flavor}, lens: _{lens}_): {one}"
+            lines.append(line)
+        lines.append("")
+
+    if mr:
+        lines.append("## Phase 3 — meta-reflection")
+        lines.append("")
+        for k, v in mr.items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
+
+    if not alternatives:
+        lines.append("_No alternatives produced this round._")
+        return "\n".join(lines) + "\n"
+
+    lines.append(f"# Phase 4 — selected alternatives ({len(alternatives)})")
     for a in alternatives:
         lines.append("")
         lines.append(f"## `{a['id']}` — {a.get('cognitive_move', '?')}")

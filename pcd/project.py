@@ -186,24 +186,31 @@ class Project:
         iteration: int,
         alternatives: list[dict],
         hard_constraints: list[str] | None = None,
+        brainstorm_sketches: list[dict] | None = None,
+        meta_reflection: dict | None = None,
         trigger: str = "scheduled",
     ) -> Path:
         """Log a Reframer-produced alternatives package.
 
-        `trigger` names the reason we ran Reframer this round (currently
-        always "scheduled"). Also writes the rounds/iter_NNN/alternatives.md
-        sibling so humans can skim the package without spelunking jsonl.
-        Returns the markdown path.
+        Besides the finalized alternatives, also persists the phase-2
+        brainstorm sketches and the phase-3 meta_reflection — these
+        let humans and the Exploration critic audit whether the
+        Reframer actually explored widely or short-circuited to 3
+        safe alts.
         """
         # Local import avoids project ← issues import cycle.
         from pcd.issues import format_alternatives_summary
 
         hc = list(hard_constraints or [])
+        bs = list(brainstorm_sketches or [])
+        mr = dict(meta_reflection or {})
         record = {
             "iteration": iteration,
             "timestamp": self.now_iso(),
             "trigger": trigger,
             "hard_constraints": hc,
+            "brainstorm_sketches": bs,
+            "meta_reflection": mr,
             "alternatives": alternatives,
         }
         self._append_jsonl(self.alternatives_log_path, record)
@@ -211,7 +218,12 @@ class Project:
         round_dir = self.rounds_dir / f"iter_{iteration:03d}"
         round_dir.mkdir(parents=True, exist_ok=True)
         md_path = round_dir / "alternatives.md"
-        md_body = format_alternatives_summary(alternatives, hc)
+        md_body = format_alternatives_summary(
+            alternatives,
+            hc,
+            brainstorm_sketches=bs,
+            meta_reflection=mr,
+        )
         md_path.write_text(
             f"<!-- trigger: {trigger} -->\n\n{md_body}", encoding="utf-8"
         )

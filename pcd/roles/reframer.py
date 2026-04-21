@@ -69,10 +69,12 @@ def run_reframer(
         role_name="reframer",
         body=_body,
     )
-    hard_constraints, alternatives = parse_reframer_output(result.final_text)
-    package = {
-        "hard_constraints": hard_constraints,
-        "alternatives": alternatives,
-    }
-    issues = alternatives_to_issues(alternatives, hard_constraints)
+    package = parse_reframer_output(result.final_text)
+    # package has: hard_constraints, brainstorm_sketches,
+    # meta_reflection, alternatives. Keep the full dict so the
+    # Exploration critic can audit phase-2/3 distribution, but only
+    # the alternatives become issues for the Judge.
+    issues = alternatives_to_issues(
+        package["alternatives"], package["hard_constraints"]
+    )
     return issues, package, contaminated

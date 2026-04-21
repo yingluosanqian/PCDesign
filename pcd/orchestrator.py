@@ -583,6 +583,8 @@ def _maybe_run_reframer_phase(
             iteration=iteration,
             alternatives=reframer_package.get("alternatives") or [],
             hard_constraints=reframer_package.get("hard_constraints") or [],
+            brainstorm_sketches=reframer_package.get("brainstorm_sketches") or [],
+            meta_reflection=reframer_package.get("meta_reflection") or {},
             trigger=trigger,
         )
         print(
