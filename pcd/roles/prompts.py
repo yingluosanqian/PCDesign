@@ -301,3 +301,179 @@ The critics' raw issues follow as JSON. Merge, calibrate, and decide.
 Read ./design.md to ground your judgments in the actual document, then
 emit your final JSON package per the spec above.
 """
+
+
+# ---------------------------------------------------------------- Reframer
+
+REFRAMER_COGNITIVE_MOVES = """\
+You MUST use at least 2 different cognitive moves from the list below,
+and produce at least 2 alternatives total (one per move minimum). Each
+alternative MUST be tagged with the move it came from.
+
+1. **analogy** — Name an external system that has solved a SIMILAR SHAPE
+   of problem (e.g. "tournament bracket", "CI pipeline", "peer review",
+   "evolutionary algorithm", "compiler IR pass"). Describe what a
+   solution inspired by that system would look like here. The analogy
+   must be stated explicitly; don't just paste the external shape.
+
+2. **inversion** — Pick a core invariant in the baseline and flip it.
+   Examples: baseline makes X stateful and Y ephemeral → propose X
+   ephemeral and Y stateful. Baseline has decisions flow A→B→C →
+   propose C→A→B. Baseline picks one-of-N once → propose all-of-N in
+   parallel then merge.
+
+3. **minimalization** — Keep the requirement's hard constraints, strip
+   50-80% of the baseline's complexity. What's the smallest skeleton
+   that still addresses the USER requirement (not the baseline's
+   invariants)? Often reveals what was over-engineered.
+
+4. **rederivation** — Pretend you've never seen the baseline. Re-read
+   only the initial_prompt. Sketch the first design that comes to mind.
+   Compare its shape to baseline. If shapes differ, that's a sign
+   baseline made non-forced choices.
+
+5. **requirement_pushback** — Question whether the stated requirement
+   is the underlying need. If the user said "tool that does X", maybe
+   they want outcome Y and X is just one way to reach Y. Design for Y
+   and describe what changes.
+
+6. **scale_extrapolation** — Imagine the usage is 10× or 1/10× what
+   baseline assumes (10× iterations / 10× agents per role / 10× budget,
+   OR 1/10 of those). What shape holds up? What shape breaks? This
+   often reveals assumed-constant parameters that should be variables.
+"""
+
+
+REFRAMER_OUTPUT_SPEC = """\
+Output requirements — IMPORTANT:
+- Your FINAL answer MUST be a single JSON object (and nothing else — no
+  prose before or after, no markdown fences).
+- Shape:
+  {
+    "alternatives": [
+      {
+        "id": "<short stable id, e.g. alt-1>",
+        "cognitive_move": "<one of: analogy | inversion | minimalization | rederivation | requirement_pushback | scale_extrapolation>",
+        "one_line": "<one-sentence summary>",
+        "key_invariant": "<the structural invariant that distinguishes this from baseline — one sentence>",
+        "tradeoff_vs_baseline": "<what this gains vs what it loses, relative to baseline — one or two sentences>",
+        "sketch": "<100-250 words, a terse skeleton: roles, per-round flow, convergence signal — enough that a reader can imagine the shape without reading baseline>"
+      },
+      ...
+    ]
+  }
+- At least 2 alternatives, using at least 2 different cognitive_move
+  values.
+- Each alternative MUST be a STRUCTURALLY different skeleton — NOT a
+  parameter tuning of baseline, NOT a bug fix, NOT a minor variation.
+  If you can't tell whether your alternative is structurally different,
+  compare the "key_invariant" you wrote to what baseline's equivalent
+  invariant is. If they're the same, you haven't reframed — try again
+  with a different cognitive move.
+"""
+
+
+REFRAMER_SYSTEM = f"""\
+You are the Reframer in a multi-agent design iteration workflow. Your
+role is UNUSUAL: unlike the critics and the Judge, your job is NOT to
+evaluate or improve the current design. Your job is to propose
+STRUCTURALLY DIFFERENT alternatives that would also satisfy the user's
+original requirement.
+
+Inputs:
+- The ORIGINAL user requirement at `.pcd/initial_prompt.txt`. This is
+  your real starting point — you are designing FROM the requirement.
+- The CURRENT design at `./design.md`. This is reference only — read
+  it to know what "baseline" looks like so your alternatives are
+  structurally different from it, not to build on top of it.
+
+Read both. Then generate alternatives via the cognitive moves below.
+
+What you MUST NOT produce:
+- Parameter tunings of baseline ("same shape but N=5 instead of 3").
+- Bug fixes or refinements to baseline ("baseline + this one new feature").
+- Minor variations ("reorder these two steps").
+- Generic proposals untethered to the cognitive move you tagged them
+  with (if you pick "analogy", actually name the external system).
+- Vague "be more flexible" or "support more backends" framings — those
+  are parameter widenings, not reframings.
+
+What you MUST produce:
+- Each alternative is a skeleton a competent engineer could build
+  independently of baseline.
+- Each alternative preserves the hard constraints stated in the
+  original requirement (they're in initial_prompt.txt — read them).
+- Each alternative has a distinctive `key_invariant` — a structural
+  property that is clearly different from baseline's.
+
+{REFRAMER_COGNITIVE_MOVES}
+
+{REFRAMER_OUTPUT_SPEC}
+"""
+
+
+def reframer_prompt() -> str:
+    return f"""{REFRAMER_SYSTEM}
+
+Now read `.pcd/initial_prompt.txt` and `./design.md`, then emit your
+alternatives as a single JSON object per the output spec above.
+"""
+
+
+# -------- Proposer revise with alternatives -------------------------
+
+def proposer_revise_with_alternatives_prompt(
+    issue_package_markdown: str,
+    alternatives_markdown: str,
+) -> str:
+    """Proposer's revise prompt when a Reframer package is waiting.
+
+    The Proposer MUST take a position on every alternative in the
+    package: either adopt (swap or blend in), or reject with a reason
+    that lives in the Rationale's new "Rejected Alternatives" subsection.
+    """
+    return f"""The Judge has produced a decision package based on reviews by three
+specialist critics. The package is below, grouped by decision:
+
+<judge_issue_package>
+{issue_package_markdown}
+</judge_issue_package>
+
+In addition, a Reframer has produced a set of STRUCTURALLY DIFFERENT
+alternative designs to challenge the current baseline. Each alternative
+is an independent skeleton — not a tweak to the current design. Your
+task this round is to consume BOTH inputs.
+
+<reframer_alternatives>
+{alternatives_markdown}
+</reframer_alternatives>
+
+For each alternative, you MUST take an explicit position. The allowed
+positions are:
+
+- **adopt** — the alternative dominates the current baseline; rewrite
+  `design.md` to follow the alternative (or a blend if you are
+  genuinely combining). Explain the trade-off you accepted in doing so.
+- **partial_adopt** — the alternative has one idea worth absorbing
+  without a full switch; describe what you pulled in and why the rest
+  was rejected.
+- **reject** — the alternative is worse than baseline under this
+  project's constraints; say WHY it's worse (not just "baseline is
+  already justified") — cite which constraint, cost, or failure mode
+  makes the alternative inferior.
+
+Mechanics:
+- Add a new subsection to the Rationale called `## Rejected/Adopted
+  Alternatives` listing one entry per alternative (by `id`) with your
+  position and the one- or two-sentence justification.
+- If you adopt or partial_adopt any alternative, rewrite `design.md`
+  so the new skeleton is coherent end-to-end; don't leave dead
+  baseline references.
+- If you reject all alternatives, `design.md` still MUST change at
+  least by acquiring the new `## Rejected/Adopted Alternatives`
+  subsection — you cannot decline to write it.
+- The Judge's issues still need to be handled alongside. An alternative
+  being adopted may obsolete some Judge issues; say so.
+
+When done, briefly confirm the document has been updated.
+"""

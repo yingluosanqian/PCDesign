@@ -7,6 +7,7 @@ run on either codex or claude by passing `agent="codex"` or `agent="claude"`.
 from pcd.roles.critic import CRITIC_ROLES, SECTION_BY_ROLE, run_critic
 from pcd.roles.judge import run_judge
 from pcd.roles.proposer import run_proposer_create, run_proposer_revise
+from pcd.roles.reframer import run_reframer
 
 __all__ = [
     "CRITIC_ROLES",
@@ -15,4 +16,5 @@ __all__ = [
     "run_judge",
     "run_proposer_create",
     "run_proposer_revise",
+    "run_reframer",
 ]

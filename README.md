@@ -107,6 +107,11 @@ A round is considered converged when ALL of the following hold:
    and the round before the current one must not be a no-op / failure
    (see *Degraded rounds* below).
 3. **Not degraded**: the current round itself is non-degraded.
+4. **Reframe-tested** (see *Reframer* below): the Proposer has
+   responded at least once to a Reframer-produced alternatives
+   package. Prevents the loop from claiming convergence on a design
+   that has never been challenged with structurally-different
+   alternatives.
 
 Round 1 is therefore never automatically converged — there's no prior
 non-degraded round to compare against. Clean round-1 judgments skip
@@ -150,6 +155,77 @@ Degraded rounds:
 They still appear in `.pcd/judgments.jsonl`, `.pcd/rounds/iter_NNN/`,
 and `pcd status` — tagged with `degraded: true` plus a `degraded_reasons`
 list explaining why.
+
+### Reframer
+
+The critic / Judge pipeline is a refinement loop: critics find flaws,
+Judge merges them, Proposer fixes them. Refinement keeps the current
+design shape and tightens it. It does not explore alternative shapes —
+a local optimum in a narrow corner of design space will pass all
+critics and declare converged. The **Reframer** is PCDesign's
+exploration primitive: a separate role whose only job is to generate
+structurally-different alternative designs.
+
+Unlike critics, Reframer:
+
+- Reads the **original** requirement (`.pcd/initial_prompt.txt`) rather
+  than starting from the current `design.md`. The current design is
+  reference only.
+- Is explicitly required to pick **at least 2 of 6 cognitive moves** —
+  *analogy*, *inversion*, *minimalization*, *rederivation*,
+  *requirement_pushback*, *scale_extrapolation* — and produce one
+  alternative per move. Each alternative must be a structurally
+  different skeleton, not a parameter tuning of the current design.
+- Outputs `alternatives.jsonl` (one record per Reframer run) and a
+  per-round markdown summary at `.pcd/rounds/iter_NNN/alternatives.md`.
+
+**When Reframer runs (at most once per `run-until-stop` invocation,
+gated by `meta.reframe_tested`):**
+
+- **Scheduled trigger**: at the first iteration `>=
+  meta.reframe_at_round` (default `2`). Fires early so the Proposer
+  hasn't yet deeply committed to the current shape's refinement
+  direction.
+- **Converge gate**: if the round would otherwise declare converged
+  but `reframe_tested` is still False, Reframer fires instead and
+  convergence is deferred. This guarantees no run can claim
+  convergence without ever being structurally challenged.
+
+**What happens after Reframer fires:**
+
+1. Alternatives are logged to `alternatives.jsonl` and the per-round
+   markdown.
+2. `meta.reframe_pending` is set to `true` and persisted before the
+   Proposer revise starts — so a crash between Reframer and revise is
+   recoverable (next invocation consumes the pending alts instead of
+   re-running Reframer).
+3. The Proposer's revise this round is forced (even if the Judge's
+   package was empty). The Proposer receives the Judge package AND the
+   alternatives, and must take an **explicit position** on each
+   alternative — *adopt* (swap / blend), *partial_adopt* (absorb one
+   idea), or *reject* (argue why baseline beats it).
+4. The Proposer's Rationale gains a `Rejected/Adopted Alternatives`
+   subsection that records every position for future critics to read.
+5. `meta.reframe_tested` is set to `true`; `reframe_pending` clears.
+   Future rounds can now declare convergence on the normal path.
+
+This costs +1 agent call per `run-until-stop` and forces an extra
+Proposer revise. In exchange, a converged PCDesign design.md has
+been explicitly compared against at least one structurally-different
+alternative, and the Rationale carries the explicit argument for why
+that alternative was rejected (or adopted).
+
+Per-role configuration mirrors the other agents:
+
+```bash
+pcd init myproj --prompt-file brief.md \
+  --agent claude \
+  --reframer-agent claude          # default: same as --agent
+  --reframer-model opus-max        # default: backend default
+
+pcd run-until-stop myproj --max-iter 5 \
+  --reframer-reasoning high        # default: medium
+```
 
 ### Example
 
@@ -226,11 +302,12 @@ round. The knob maps to each backend's native control:
 <name>/
   design.md                 # the living design (rewritten each round)
   .pcd/
-    meta.json               # thread id, models, iteration counter, convergence
+    meta.json               # thread id, models, iteration counter, convergence, reframe state
     initial_prompt.txt      # the --prompt you passed to `init`
-    judgments.jsonl         # append-only: critics' raw issues + Judge's package (with `manually_edited` flag)
-    revisions.jsonl         # append-only: "revised" / "converged — no revise" / "quality ok, awaiting stability — no revise"
+    judgments.jsonl         # append-only: critics' raw issues + Judge's package (with `manually_edited` and `degraded` flags)
+    revisions.jsonl         # append-only: "revised" / "converged — no revise" / ... / "revised with alternatives"
     human_checks.jsonl      # append-only: records from `pcd check`
+    alternatives.jsonl      # append-only: Reframer-produced alternative packages, one record per Reframer run
     rounds/                 # per-iteration breakout, written fresh each round
       iter_001/
         critic_requirement.json
@@ -238,6 +315,7 @@ round. The knob maps to each backend's native control:
         critic_rationale.json
         judgment.json
         summary.md          # one-page markdown rollup: all critics + judge package + counts
+        alternatives.md     # present only on rounds where Reframer fired
       iter_002/
         ...
 ```

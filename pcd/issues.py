@@ -9,6 +9,14 @@ from typing import Any, Iterable
 
 VALID_SEVERITIES = ("high", "medium", "low")
 VALID_DECISIONS = ("must_fix", "should_fix", "reject", "defer")
+VALID_COGNITIVE_MOVES = (
+    "analogy",
+    "inversion",
+    "minimalization",
+    "rederivation",
+    "requirement_pushback",
+    "scale_extrapolation",
+)
 
 
 def extract_json(text: str) -> Any:
@@ -91,6 +99,95 @@ def parse_critic_issues(role: str, text: str) -> list[dict]:
             }
         )
     return issues
+
+
+def parse_alternatives(text: str) -> list[dict]:
+    """Normalize a Reframer's raw response into a list of alternative dicts.
+
+    Each alt preserves id / cognitive_move / one_line / key_invariant /
+    tradeoff_vs_baseline / sketch. Invalid cognitive_moves fall back to
+    "rederivation" (the most generic one) with a record of the bad value
+    in `invalid_cognitive_move_raw` so we can tell the LLM tagged it
+    badly vs. really did a rederivation.
+    """
+    data = extract_json(text)
+    if isinstance(data, dict) and "alternatives" in data:
+        data = data["alternatives"]
+    if not isinstance(data, list):
+        raise ValueError("reframer output is not a JSON array of alternatives")
+    out: list[dict] = []
+    for i, raw in enumerate(data):
+        if not isinstance(raw, dict):
+            continue
+        move_raw = str(raw.get("cognitive_move") or "")
+        move = move_raw if move_raw in VALID_COGNITIVE_MOVES else "rederivation"
+        entry: dict = {
+            "id": str(raw.get("id") or f"alt-{i+1}"),
+            "cognitive_move": move,
+            "one_line": str(raw.get("one_line") or "unspecified"),
+            "key_invariant": str(raw.get("key_invariant") or ""),
+            "tradeoff_vs_baseline": str(raw.get("tradeoff_vs_baseline") or ""),
+            "sketch": str(raw.get("sketch") or ""),
+        }
+        if move != move_raw:
+            entry["invalid_cognitive_move_raw"] = move_raw
+        out.append(entry)
+    return out
+
+
+def format_alternatives_for_proposer(alternatives: list[dict]) -> str:
+    """Render alternatives as a markdown block for the Proposer's prompt."""
+    if not alternatives:
+        return "_(Reframer produced no alternatives this round.)_"
+    lines: list[str] = [f"Reframer produced {len(alternatives)} alternative(s)."]
+    for a in alternatives:
+        lines.append("")
+        lines.append(
+            f"### `{a['id']}` — {a.get('cognitive_move', '?')}"
+        )
+        lines.append(f"**One-line**: {a.get('one_line', '')}")
+        if a.get("key_invariant"):
+            lines.append(f"**Key invariant vs baseline**: {a['key_invariant']}")
+        if a.get("tradeoff_vs_baseline"):
+            lines.append(
+                f"**Trade-off vs baseline**: {a['tradeoff_vs_baseline']}"
+            )
+        if a.get("sketch"):
+            lines.append("")
+            lines.append("**Sketch:**")
+            lines.append(a["sketch"])
+    return "\n".join(lines)
+
+
+def format_alternatives_summary(alternatives: list[dict]) -> str:
+    """Render alternatives as a standalone markdown summary for rounds/iter_NNN/."""
+    if not alternatives:
+        return "_No alternatives produced this round._\n"
+    lines: list[str] = [f"# Reframer alternatives ({len(alternatives)})"]
+    for a in alternatives:
+        lines.append("")
+        lines.append(f"## `{a['id']}` — {a.get('cognitive_move', '?')}")
+        lines.append("")
+        lines.append(f"**{a.get('one_line', '')}**")
+        if a.get("key_invariant"):
+            lines.append("")
+            lines.append(f"- **Key invariant vs baseline**: {a['key_invariant']}")
+        if a.get("tradeoff_vs_baseline"):
+            lines.append(
+                f"- **Trade-off vs baseline**: {a['tradeoff_vs_baseline']}"
+            )
+        if a.get("invalid_cognitive_move_raw"):
+            lines.append(
+                f"- _(raw cognitive_move tag was "
+                f"`{a['invalid_cognitive_move_raw']}` — normalized to "
+                f"`{a['cognitive_move']}`)_"
+            )
+        if a.get("sketch"):
+            lines.append("")
+            lines.append("### Sketch")
+            lines.append("")
+            lines.append(a["sketch"])
+    return "\n".join(lines) + "\n"
 
 
 def parse_judgment(text: str) -> dict:

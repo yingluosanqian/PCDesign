@@ -50,6 +50,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--proposer-agent", choices=SUPPORTED_AGENTS, default=None)
     p_init.add_argument("--critic-agent", choices=SUPPORTED_AGENTS, default=None)
     p_init.add_argument("--judge-agent", choices=SUPPORTED_AGENTS, default=None)
+    p_init.add_argument(
+        "--reframer-agent",
+        choices=SUPPORTED_AGENTS,
+        default=None,
+        help="Agent for the Reframer (alternative-generator) role. "
+        "Defaults to --agent if unset.",
+    )
+    p_init.add_argument(
+        "--reframer-model",
+        default=None,
+        help="Model for the Reframer role (backend default if unset).",
+    )
 
     p_once = sub.add_parser(
         "run-once", help="Run exactly one critic+judge(+revise) iteration."
@@ -98,6 +110,7 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--proposer-reasoning", default="medium")
     p.add_argument("--critic-reasoning", default="medium")
     p.add_argument("--judge-reasoning", default="medium")
+    p.add_argument("--reframer-reasoning", default="medium")
 
 
 def _resolve_initial_prompt(args: argparse.Namespace) -> str:
@@ -137,6 +150,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     proposer_agent = normalize_agent(args.proposer_agent or args.agent)
     critic_agent = normalize_agent(args.critic_agent or args.agent)
     judge_agent = normalize_agent(args.judge_agent or args.agent)
+    reframer_agent = normalize_agent(args.reframer_agent or args.agent)
     project.create_layout(initial_prompt=prompt_text)
     print(f"[pcd] created project at {project.root}", file=sys.stderr)
     print(
@@ -163,6 +177,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
             proposer_agent=proposer_agent,
             critic_agent=critic_agent,
             judge_agent=judge_agent,
+            reframer_agent=reframer_agent,
+            reframer_model=args.reframer_model,
         )
     )
     if not project.design_path.exists():
@@ -196,6 +212,9 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
         proposer_agent=meta.proposer_agent,
         critic_agent=meta.critic_agent,
         judge_agent=meta.judge_agent,
+        reframer_model=meta.reframer_model,
+        reframer_reasoning=args.reframer_reasoning,
+        reframer_agent=meta.reframer_agent,
         manual_judge=args.manual_judge,
     )
     meta = project.load_meta()
@@ -224,6 +243,9 @@ def _cmd_run_until_stop(args: argparse.Namespace) -> int:
         proposer_agent=meta.proposer_agent,
         critic_agent=meta.critic_agent,
         judge_agent=meta.judge_agent,
+        reframer_model=meta.reframer_model,
+        reframer_reasoning=args.reframer_reasoning,
+        reframer_agent=meta.reframer_agent,
     )
     meta = project.load_meta()
     print(
@@ -247,6 +269,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"  proposer_agent:   {meta.proposer_agent}")
     print(f"  critic_agent:     {meta.critic_agent}")
     print(f"  judge_agent:      {meta.judge_agent}")
+    print(f"  reframer_agent:   {meta.reframer_agent}")
+    print(f"  reframer_model:   {meta.reframer_model}")
+    print(f"  reframe_at_round: {meta.reframe_at_round}")
+    print(f"  reframe_tested:   {meta.reframe_tested}")
+    print(f"  reframe_pending:  {meta.reframe_pending}")
     print(f"  iterations_done:  {meta.iterations_done}")
     print(f"  converged:        {meta.converged}")
     if meta.convergence_note:
