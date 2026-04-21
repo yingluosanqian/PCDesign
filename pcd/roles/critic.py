@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 from pcd.agents import make_agent_client
 from pcd.issues import parse_critic_issues
-from pcd.roles._guard import readonly_guarded
+from pcd.roles._guard import private_staging
 from pcd.roles.prompts import (
     design_critic_prompt,
     rationale_critic_prompt,
@@ -35,6 +35,7 @@ def run_critic(
     *,
     role: str,
     project_root: Path,
+    iteration: int,
     model: Optional[str],
     reasoning_effort: str = "medium",
     agent: str = "codex",
@@ -42,32 +43,38 @@ def run_critic(
 ) -> tuple[list[dict], bool]:
     """Run one fresh critic session for the given role.
 
-    Returns `(issues, contaminated)`. `contaminated` is True if the
-    critic subprocess modified design.md (claude has no read-only
-    sandbox, so this is the structural enforcement); in that case the
-    file has been restored from a pre-call snapshot.
+    Runs inside a per-critic private staging dir so the shared
+    design.md is not even in the critic's cwd. Returns
+    `(issues, contaminated)` where `contaminated=True` means the
+    critic wrote to its private design.md (C11 violation) — its
+    output should be discarded by the caller.
     """
     if role not in _PROMPT_BY_ROLE:
         raise ValueError(f"unknown critic role: {role!r}")
 
-    def _body():
+    def _body(staging_dir: Path):
         with make_agent_client(
             agent,
-            cwd=str(project_root),
+            cwd=str(staging_dir),
             reasoning_effort=reasoning_effort,
         ) as client:
             thread_id = client.start_thread(
-                cwd=str(project_root),
+                cwd=str(staging_dir),
                 model=model,
                 sandbox="read-only",
             )
             return client.run_turn(
                 thread_id=thread_id,
-                cwd=str(project_root),
+                cwd=str(staging_dir),
                 model=model,
                 prompt=_PROMPT_BY_ROLE[role](),
                 on_progress=on_progress,
             )
 
-    result, contaminated = readonly_guarded(project_root, _body)
+    result, contaminated = private_staging(
+        project_root=project_root,
+        iteration=iteration,
+        role_name=f"critic_{role}",
+        body=_body,
+    )
     return parse_critic_issues(role, result.final_text), contaminated

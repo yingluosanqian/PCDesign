@@ -26,10 +26,9 @@ pcd init pcd-self \
   --reasoning max
 
 # 2. 最多迭代 10 轮；收敛或连续两轮 must_fix 不降就自动停。
-pcd run-until-stop pcd-self --max-iter 10 \
-  --proposer-reasoning max \
-  --critic-reasoning max \
-  --judge-reasoning max
+pcd run-until-stop pcd --max-iter 10 \
+  --proposer-reasoning high --critic-reasoning high --judge-reasoning high \
+  --reframer-reasoning high
 
 # 3. 查状态 + must_fix 走势。
 pcd status pcd-self

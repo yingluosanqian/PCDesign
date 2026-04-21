@@ -9,13 +9,22 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
 from pcd.issues import (
+    format_guidance_for_proposer,
     format_issue_package_for_proposer,
     is_converged,
     is_stable,
     no_progress,
     parse_judgment,
 )
-from pcd.project import Project
+from pcd.project import (
+    Project,
+    STATUS_COMMITTED,
+    STATUS_CRITICS_DONE,
+    STATUS_JUDGE_DONE,
+    STATUS_JUDGED,
+    STATUS_PROPOSER_DONE,
+    STATUS_STARTED,
+)
 from pcd.roles import (
     CRITIC_ROLES,
     run_critic,
@@ -59,182 +68,166 @@ def run_single_iteration(
     prev_record = project.last_non_degraded_judgment()
     prev_judgment = (prev_record or {}).get("judgment") if prev_record else None
 
-    print(
-        f"[pcd] iter {iteration}: launching {len(CRITIC_ROLES)} critics in parallel",
-        file=sys.stderr,
-        flush=True,
-    )
+    # ---- Recovery check -----------------------------------------------
+    # If this iter's directory has a STATUS file from a prior crashed
+    # invocation, skip over whichever expensive steps have already run.
+    resume_status = project.read_round_status(iteration)
+    if resume_status == STATUS_COMMITTED:
+        # Shouldn't happen — committed means meta.iterations_done was
+        # bumped on the prior invocation. Be safe: warn and proceed.
+        print(
+            f"[pcd] iter {iteration}: WARNING STATUS=committed but "
+            f"iteration was not reflected in meta; restarting fresh",
+            file=sys.stderr,
+            flush=True,
+        )
+        resume_status = None
+    resumed_flags = project.load_round_flags(iteration) or {}
+    if resume_status:
+        print(
+            f"[pcd] iter {iteration}: resuming from STATUS={resume_status} "
+            f"(skipping already-completed phases)",
+            file=sys.stderr,
+            flush=True,
+        )
+
     critics_output: dict[str, list[dict]] = {}
-    critic_failures: list[str] = []
-    contaminated_critics: list[str] = []
-    with ThreadPoolExecutor(max_workers=len(CRITIC_ROLES)) as pool:
-        futures = {
-            pool.submit(
-                run_critic,
-                role=role,
-                project_root=project.root,
-                model=critic_model,
-                reasoning_effort=critic_reasoning,
-                agent=critic_agent,
-                on_progress=_make_role_progress(
-                    f"iter {iteration} critic:{role}"
-                ),
-            ): role
-            for role in CRITIC_ROLES
-        }
-        for future in futures:
-            role = futures[future]
-            try:
-                issues, contaminated = future.result()
-                critics_output[role] = issues
-                if contaminated:
-                    contaminated_critics.append(role)
-                    print(
-                        f"[pcd] iter {iteration}: critic {role!r} wrote "
-                        f"design.md; rolled back from snapshot",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            except Exception as e:
-                print(
-                    f"[pcd] iter {iteration}: critic {role!r} failed: {e}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                critics_output[role] = []
-                critic_failures.append(role)
+    critic_failures: list[str] = list(resumed_flags.get("critic_failures") or [])
+    contaminated_critics: list[str] = list(
+        resumed_flags.get("contaminated_critics") or []
+    )
+    reframer_fired: bool = bool(resumed_flags.get("reframer_fired", False))
+    reframer_trigger: str = str(resumed_flags.get("reframer_trigger") or "")
+    manually_edited: bool = bool(resumed_flags.get("manually_edited", False))
+    judge_contaminated: bool = bool(resumed_flags.get("judge_contaminated", False))
+    reframer_package: Optional[dict] = None
 
-    # ---- Reframer / Exploration critics (conditional on trigger) ----
-    # Reframer fires at most once per `run-until-stop`, gated by
-    # meta.reframe_tested. Trigger: iteration >= meta.reframe_at_round
-    # AND not yet tested. Its output flows through the Judge just like
-    # the other three critics — critic → judge → proposer is a single
-    # unified pipeline. Exploration critic runs on the same round,
-    # sequentially after Reframer (it needs the Reframer package).
-    #
-    # No converge-gate here: the gate lives in run_until_stop, which
-    # refuses to exit on converged while reframe_tested is still False.
-    # Default reframe_at_round=2 means Reframer fires at iter 2 on
-    # every project, long before any sane convergence can happen.
-    reframer_fired = False
-    reframer_trigger = ""
-    exploration_contaminated = False
-    if not meta.reframe_tested and iteration >= meta.reframe_at_round:
-        reframer_trigger = "scheduled"
+    if _past(resume_status, STATUS_CRITICS_DONE):
+        # Phase 1 already done: load everything critics produced.
+        resume_roles = list(CRITIC_ROLES)
+        if reframer_fired:
+            resume_roles += ["reframer", "exploration"]
+        critics_output = project.load_critics_output_from_disk(
+            iteration, iter(resume_roles)
+        )
+        if reframer_fired:
+            reframer_package = project.load_reframer_package(iteration)
+        total_issues = sum(len(v) for v in critics_output.values())
         print(
-            f"[pcd] iter {iteration}: Reframer firing "
-            f"(trigger={reframer_trigger})",
+            f"[pcd] iter {iteration}: recovered {len(critics_output)} critics' "
+            f"output ({total_issues} raw issues) from disk",
             file=sys.stderr,
             flush=True,
         )
-        try:
-            reframer_issues, reframer_package, reframer_contaminated = run_reframer(
-                project_root=project.root,
-                model=reframer_model,
-                reasoning_effort=reframer_reasoning,
-                agent=reframer_agent,
-                on_progress=_make_role_progress(
-                    f"iter {iteration} reframer"
-                ),
-            )
-            reframer_fired = True
-            critics_output["reframer"] = reframer_issues
-            alt_path = project.append_alternatives(
-                iteration=iteration,
-                alternatives=reframer_package.get("alternatives") or [],
-                hard_constraints=reframer_package.get("hard_constraints") or [],
-                trigger=reframer_trigger,
-            )
-            print(
-                f"[pcd] iter {iteration}: Reframer produced "
-                f"{len(reframer_issues)} alternative(s); dumped to {alt_path}",
-                file=sys.stderr,
-                flush=True,
-            )
-            if reframer_contaminated:
-                contaminated_critics.append("reframer")
-                print(
-                    f"[pcd] iter {iteration}: reframer wrote design.md; "
-                    f"rolled back from snapshot",
-                    file=sys.stderr,
-                    flush=True,
-                )
+    else:
+        # Round-level audit snapshot — captures the design.md state that
+        # critics read, for forensics after contamination / rollback.
+        project.snapshot_design_pre_critics(iteration)
+        project.write_round_status(iteration, STATUS_STARTED)
+        _run_critics_phase(
+            project=project,
+            iteration=iteration,
+            critic_model=critic_model,
+            critic_reasoning=critic_reasoning,
+            critic_agent=critic_agent,
+            critics_output=critics_output,
+            critic_failures=critic_failures,
+            contaminated_critics=contaminated_critics,
+        )
+        # Reframer / exploration (conditional).
+        fired, trigger, pkg = _maybe_run_reframer_phase(
+            project=project,
+            iteration=iteration,
+            meta=meta,
+            reframer_model=reframer_model,
+            reframer_reasoning=reframer_reasoning,
+            reframer_agent=reframer_agent,
+            critics_output=critics_output,
+            critic_failures=critic_failures,
+            contaminated_critics=contaminated_critics,
+        )
+        reframer_fired = fired
+        reframer_trigger = trigger
+        reframer_package = pkg
+        # Persist per-critic outputs as we go for crash recovery.
+        for role, issues in critics_output.items():
+            project.persist_critic_output(iteration, role, issues)
+        if reframer_package is not None:
+            project.persist_reframer_package(iteration, reframer_package)
+        project.persist_round_flags(
+            iteration,
+            {
+                "critic_failures": critic_failures,
+                "contaminated_critics": contaminated_critics,
+                "reframer_fired": reframer_fired,
+                "reframer_trigger": reframer_trigger,
+            },
+        )
+        project.write_round_status(iteration, STATUS_CRITICS_DONE)
 
-            # Exploration critic runs sequentially after Reframer —
-            # it audits the Reframer package and needs it as input.
-            print(
-                f"[pcd] iter {iteration}: Exploration critic auditing "
-                f"Reframer package",
-                file=sys.stderr,
-                flush=True,
-            )
-            try:
-                exploration_issues, exploration_contaminated = run_exploration_critic(
-                    project_root=project.root,
-                    reframer_package=reframer_package,
-                    model=reframer_model,
-                    reasoning_effort=reframer_reasoning,
-                    agent=reframer_agent,
-                    on_progress=_make_role_progress(
-                        f"iter {iteration} exploration"
-                    ),
-                )
-                critics_output["exploration"] = exploration_issues
-                if exploration_contaminated:
-                    contaminated_critics.append("exploration")
-                    print(
-                        f"[pcd] iter {iteration}: exploration critic wrote "
-                        f"design.md; rolled back from snapshot",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-            except Exception as e:
-                print(
-                    f"[pcd] iter {iteration}: Exploration critic failed: {e}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                critic_failures.append("exploration")
-                critics_output["exploration"] = []
-        except Exception as e:
-            print(
-                f"[pcd] iter {iteration}: Reframer failed: {e}",
-                file=sys.stderr,
-                flush=True,
-            )
-            critic_failures.append("reframer")
-            critics_output["reframer"] = []
-
-    # ---- Judge (now possibly on 5 critic inputs) ---------------------
-    total_issues = sum(len(v) for v in critics_output.values())
-    print(
-        f"[pcd] iter {iteration}: {len(critics_output)} critics produced "
-        f"{total_issues} raw issues; judging",
-        file=sys.stderr,
-        flush=True,
-    )
-    judgment, judge_contaminated = run_judge(
-        project_root=project.root,
-        critics_output=critics_output,
-        model=judge_model,
-        reasoning_effort=judge_reasoning,
-        agent=judge_agent,
-        on_progress=_make_role_progress(f"iter {iteration} judge"),
-    )
-    if judge_contaminated:
+    # ---- Judge (skipped if resumed at/after judge_done) ---------------
+    if _past(resume_status, STATUS_JUDGE_DONE):
+        judgment = project.load_judgment_artifact(iteration) or {}
         print(
-            f"[pcd] iter {iteration}: judge wrote design.md; rolled back "
-            f"from snapshot",
+            f"[pcd] iter {iteration}: recovered judgment.json from disk",
             file=sys.stderr,
             flush=True,
         )
+    else:
+        total_issues = sum(len(v) for v in critics_output.values())
+        print(
+            f"[pcd] iter {iteration}: {len(critics_output)} critics produced "
+            f"{total_issues} raw issues; judging",
+            file=sys.stderr,
+            flush=True,
+        )
+        judgment, judge_contaminated = run_judge(
+            project_root=project.root,
+            iteration=iteration,
+            critics_output=critics_output,
+            model=judge_model,
+            reasoning_effort=judge_reasoning,
+            agent=judge_agent,
+            on_progress=_make_role_progress(f"iter {iteration} judge"),
+        )
+        if judge_contaminated:
+            print(
+                f"[pcd] iter {iteration}: judge wrote design.md; rolled back "
+                f"from snapshot",
+                file=sys.stderr,
+                flush=True,
+            )
+        project.persist_judgment(iteration, judgment)
+        project.persist_round_flags(
+            iteration,
+            {
+                "critic_failures": critic_failures,
+                "contaminated_critics": contaminated_critics,
+                "reframer_fired": reframer_fired,
+                "reframer_trigger": reframer_trigger,
+                "judge_contaminated": judge_contaminated,
+            },
+        )
+        project.write_round_status(iteration, STATUS_JUDGE_DONE)
 
-    manually_edited = False
-    if manual_judge:
+    if _past(resume_status, STATUS_JUDGED):
+        # On resume, manually_edited was already restored from round_flags.
+        pass
+    elif manual_judge:
         edited = _open_judgment_in_editor(project, iteration, judgment)
         if edited is not None:
             judgment = edited
             manually_edited = True
+            project.persist_judgment(iteration, judgment)
+            project.persist_round_flags(
+                iteration,
+                {
+                    **(project.load_round_flags(iteration) or {}),
+                    "manually_edited": True,
+                },
+            )
+    if not _past(resume_status, STATUS_JUDGED):
+        project.write_round_status(iteration, STATUS_JUDGED)
 
     summary = judgment.get("summary") or {}
     quality_ok = is_converged(judgment)
@@ -252,11 +245,18 @@ def run_single_iteration(
     if judge_contaminated:
         degraded_reasons.append("judge modified design.md (rolled back)")
     degraded = bool(degraded_reasons)
-    # Convergence now requires reframe_tested too — but since Reframer
-    # fires this round if not yet tested, reframe_tested is read AFTER
-    # we've decided whether this round fires it. If Reframer fired this
-    # round, reframe_tested is about-to-be-True.
-    reframe_gate_ok = meta.reframe_tested or reframer_fired
+    # Convergence gate (see design doc §2.4):
+    #   (i)  reframe_tested — Reframer fired and its issues flowed through
+    #        Judge. Satisfied either already (prior round) or this round
+    #        (we just fired it).
+    #   (ii) reframe_degraded_confirmed — Reframer failed twice, the
+    #        human explicitly acknowledged the missing coverage via
+    #        `pcd check --result confirm_reframe_degraded`.
+    reframe_gate_ok = (
+        meta.reframe_tested
+        or reframer_fired
+        or meta.reframe_degraded_confirmed
+    )
     converged = quality_ok and stable and not degraded and reframe_gate_ok
     print(
         f"[pcd] iter {iteration}: summary {summary}; "
@@ -268,7 +268,14 @@ def run_single_iteration(
     )
 
     revise_note = ""
-    if degraded:
+    resumed_revise_outcome = resumed_flags.get("revise_outcome")
+    if _past(resume_status, STATUS_PROPOSER_DONE) and resumed_revise_outcome:
+        # Revise already completed in the crashed run; restore its outcome.
+        revise_note = str(resumed_revise_outcome.get("note") or "")
+        if resumed_revise_outcome.get("proposer_noop"):
+            degraded = True
+            degraded_reasons.append("proposer no-op (design.md unchanged)")
+    elif degraded:
         revise_note = (
             "degraded — no revise (" + "; ".join(degraded_reasons) + ")"
         )
@@ -287,11 +294,21 @@ def run_single_iteration(
         # an empty package.
         revise_note = "quality ok, awaiting stability — no revise"
     else:
-        print(
-            f"[pcd] iter {iteration}: proposer revising with judge package",
-            file=sys.stderr,
-            flush=True,
-        )
+        pending_guidance = project.pending_guidance()
+        guidance_md = format_guidance_for_proposer(pending_guidance)
+        if pending_guidance:
+            print(
+                f"[pcd] iter {iteration}: proposer revising with judge "
+                f"package + {len(pending_guidance)} pending guidance entry(ies)",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                f"[pcd] iter {iteration}: proposer revising with judge package",
+                file=sys.stderr,
+                flush=True,
+            )
         issue_package_md = format_issue_package_for_proposer(judgment)
         before_hash = project.design_hash()
         run_proposer_revise(
@@ -302,6 +319,7 @@ def run_single_iteration(
             reasoning_effort=proposer_reasoning,
             agent=proposer_agent,
             on_progress=_make_role_progress(f"iter {iteration} proposer"),
+            guidance_markdown=guidance_md,
         )
         after_hash = project.design_hash()
         if (
@@ -320,6 +338,30 @@ def run_single_iteration(
             )
         else:
             revise_note = "revised"
+            # Consumed guidance gets logged so the next round doesn't
+            # re-feed it. Only mark on a successful (non-degraded) revise.
+            if pending_guidance:
+                guidance_ids = [g["id"] for g in pending_guidance if "id" in g]
+                project.mark_guidance_consumed(iteration, guidance_ids)
+                print(
+                    f"[pcd] iter {iteration}: consumed {len(guidance_ids)} "
+                    f"guidance entry(ies)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        # Persist revise outcome for crash recovery.
+        project.persist_round_flags(
+            iteration,
+            {
+                **(project.load_round_flags(iteration) or {}),
+                "revise_outcome": {
+                    "note": revise_note,
+                    "proposer_noop": degraded
+                    and any("proposer no-op" in r for r in degraded_reasons),
+                },
+            },
+        )
+        project.write_round_status(iteration, STATUS_PROPOSER_DONE)
 
     convergence_note = _describe_convergence(
         summary, quality_ok, stable, degraded, degraded_reasons,
@@ -359,6 +401,7 @@ def run_single_iteration(
         meta.reframe_tested = True
     project.save_meta(meta)
     project.append_revision(iteration=iteration, note=revise_note)
+    project.write_round_status(iteration, STATUS_COMMITTED)
     return judgment
 
 
@@ -425,6 +468,182 @@ def run_until_stop(
             file=sys.stderr,
             flush=True,
         )
+
+
+def _past(status: Optional[str], milestone: str) -> bool:
+    """True iff `status` is at or past `milestone` in STATUS_SEQUENCE."""
+    if status is None:
+        return False
+    from pcd.project import STATUS_SEQUENCE
+    try:
+        return STATUS_SEQUENCE.index(status) >= STATUS_SEQUENCE.index(milestone)
+    except ValueError:
+        return False
+
+
+def _run_critics_phase(
+    *,
+    project: Project,
+    iteration: int,
+    critic_model: Optional[str],
+    critic_reasoning: str,
+    critic_agent: str,
+    critics_output: dict[str, list[dict]],
+    critic_failures: list[str],
+    contaminated_critics: list[str],
+) -> None:
+    """Execute the three section critics in parallel, mutating the
+    passed-in dicts/lists. Kept as a helper so the critics-phase
+    code path is reusable across fresh and resumed rounds."""
+    with ThreadPoolExecutor(max_workers=len(CRITIC_ROLES)) as pool:
+        futures = {
+            pool.submit(
+                run_critic,
+                role=role,
+                project_root=project.root,
+                iteration=iteration,
+                model=critic_model,
+                reasoning_effort=critic_reasoning,
+                agent=critic_agent,
+                on_progress=_make_role_progress(
+                    f"iter {iteration} critic:{role}"
+                ),
+            ): role
+            for role in CRITIC_ROLES
+        }
+        for future in futures:
+            role = futures[future]
+            try:
+                issues, contaminated = future.result()
+                critics_output[role] = issues
+                if contaminated:
+                    contaminated_critics.append(role)
+                    print(
+                        f"[pcd] iter {iteration}: critic {role!r} wrote "
+                        f"design.md; rolled back from snapshot",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except Exception as e:
+                print(
+                    f"[pcd] iter {iteration}: critic {role!r} failed: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                critics_output[role] = []
+                critic_failures.append(role)
+
+
+def _maybe_run_reframer_phase(
+    *,
+    project: Project,
+    iteration: int,
+    meta,
+    reframer_model: Optional[str],
+    reframer_reasoning: str,
+    reframer_agent: str,
+    critics_output: dict[str, list[dict]],
+    critic_failures: list[str],
+    contaminated_critics: list[str],
+) -> tuple[bool, str, Optional[dict]]:
+    """Fire Reframer + Exploration if the scheduled trigger says so.
+
+    Returns `(fired, trigger, package)`. `package` is the raw
+    `{hard_constraints, alternatives}` dict if Reframer succeeded,
+    else None.
+    """
+    if meta.reframe_tested or iteration < meta.reframe_at_round:
+        return False, "", None
+    if meta.reframe_attempts >= 2:
+        # Already tried twice and failed both times — gate (ii) applies.
+        # Don't burn more budget; the human must acknowledge via
+        # `pcd check --result confirm_reframe_degraded`.
+        return False, "", None
+
+    trigger = "scheduled"
+    print(
+        f"[pcd] iter {iteration}: Reframer firing (trigger={trigger}, "
+        f"attempt {meta.reframe_attempts + 1}/2)",
+        file=sys.stderr,
+        flush=True,
+    )
+    meta.reframe_attempts += 1
+    project.save_meta(meta)
+    try:
+        reframer_issues, reframer_package, reframer_contaminated = run_reframer(
+            project_root=project.root,
+            iteration=iteration,
+            model=reframer_model,
+            reasoning_effort=reframer_reasoning,
+            agent=reframer_agent,
+            on_progress=_make_role_progress(f"iter {iteration} reframer"),
+        )
+        critics_output["reframer"] = reframer_issues
+        alt_path = project.append_alternatives(
+            iteration=iteration,
+            alternatives=reframer_package.get("alternatives") or [],
+            hard_constraints=reframer_package.get("hard_constraints") or [],
+            trigger=trigger,
+        )
+        print(
+            f"[pcd] iter {iteration}: Reframer produced "
+            f"{len(reframer_issues)} alternative(s); dumped to {alt_path}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if reframer_contaminated:
+            contaminated_critics.append("reframer")
+            print(
+                f"[pcd] iter {iteration}: reframer wrote design.md; "
+                f"rolled back from snapshot",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as e:
+        print(
+            f"[pcd] iter {iteration}: Reframer failed: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
+        critic_failures.append("reframer")
+        critics_output["reframer"] = []
+        return False, trigger, None
+
+    # Exploration critic runs sequentially after Reframer.
+    print(
+        f"[pcd] iter {iteration}: Exploration critic auditing Reframer package",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        exploration_issues, exploration_contaminated = run_exploration_critic(
+            project_root=project.root,
+            iteration=iteration,
+            reframer_package=reframer_package,
+            model=reframer_model,
+            reasoning_effort=reframer_reasoning,
+            agent=reframer_agent,
+            on_progress=_make_role_progress(f"iter {iteration} exploration"),
+        )
+        critics_output["exploration"] = exploration_issues
+        if exploration_contaminated:
+            contaminated_critics.append("exploration")
+            print(
+                f"[pcd] iter {iteration}: exploration critic wrote "
+                f"design.md; rolled back from snapshot",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as e:
+        print(
+            f"[pcd] iter {iteration}: Exploration critic failed: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
+        critic_failures.append("exploration")
+        critics_output["exploration"] = []
+
+    return True, trigger, reframer_package
 
 
 def _make_role_progress(role_label: str) -> Callable[[str], None]:

@@ -485,6 +485,24 @@ def format_round_summary(
     return "\n".join(lines) + "\n"
 
 
+def format_guidance_for_proposer(guidance_entries: list[dict]) -> str:
+    """Render pending user-guidance records as markdown.
+
+    Each entry gets bulleted as `- [#id] note`. Consumer is the
+    Proposer revise prompt, which in turn requires the Proposer to
+    acknowledge each entry by `#id` in the Rationale.
+    """
+    if not guidance_entries:
+        return ""
+    lines = []
+    for g in guidance_entries:
+        gid = g.get("id", "?")
+        note = g.get("note", "").strip()
+        created = g.get("created_at", "")
+        lines.append(f"- **[#{gid}]** {note}  \n  _(recorded at {created})_")
+    return "\n".join(lines)
+
+
 def format_issue_package_for_proposer(judgment: dict) -> str:
     """Render the Judge's issue package as markdown for inclusion in a prompt."""
     pkg = judgment.get("issue_package") or []

@@ -95,12 +95,34 @@ def _build_parser() -> argparse.ArgumentParser:
     p_check.add_argument(
         "--result",
         required=True,
-        choices=("confirm_stop", "reopen", "advisory_only"),
-        help="confirm_stop: mark project converged; reopen: mark not "
-        "converged; advisory_only: record only, no meta change.",
+        choices=(
+            "confirm_stop",
+            "reopen",
+            "advisory_only",
+            "confirm_reframe_degraded",
+        ),
+        help="confirm_stop: mark project converged. reopen: mark not "
+        "converged. advisory_only: record only, no meta change. "
+        "confirm_reframe_degraded: after Reframer has failed 2 times "
+        "(reframe_attempts >= 2 AND reframe_tested is False), the human "
+        "acknowledges the missing structural-alternatives coverage and "
+        "unblocks the convergence gate (gate ii).",
     )
     p_check.add_argument("--scope", default="", help="What the human reviewed.")
     p_check.add_argument("--note", default="", help="Free-form note.")
+
+    p_guide = sub.add_parser(
+        "guide",
+        help="Append a one-line user guidance for the next Proposer revise. "
+        "The Proposer must acknowledge each guidance in Rationale's "
+        "'User Guidance Received' subsection.",
+    )
+    p_guide.add_argument("project_name")
+    p_guide.add_argument(
+        "note",
+        help="The guidance text, e.g. 'be more defensive about the "
+        "crash recovery path' or 'consider IPv6 explicitly'.",
+    )
 
     return parser
 
@@ -273,6 +295,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"  reframer_model:   {meta.reframer_model}")
     print(f"  reframe_at_round: {meta.reframe_at_round}")
     print(f"  reframe_tested:   {meta.reframe_tested}")
+    print(f"  reframe_attempts: {meta.reframe_attempts}")
+    if meta.reframe_degraded_confirmed:
+        print("  reframe_gate:     unlocked via confirm_reframe_degraded")
     print(f"  iterations_done:  {meta.iterations_done}")
     print(f"  converged:        {meta.converged}")
     if meta.convergence_note:
@@ -300,6 +325,17 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"  must_fix_trend:   {mf_history}  (non-degraded rounds only)")
     if project.human_checks_log_path.exists():
         print(f"  human_checks_log: {project.human_checks_log_path}")
+    pending_guidance = project.pending_guidance()
+    if pending_guidance:
+        print(f"  pending_guidance: {len(pending_guidance)} entry(ies)")
+        for g in pending_guidance[:5]:
+            gid = g.get("id", "?")
+            note = g.get("note", "")
+            if len(note) > 80:
+                note = note[:77] + "..."
+            print(f"    [#{gid}] {note}")
+        if len(pending_guidance) > 5:
+            print(f"    ... and {len(pending_guidance) - 5} more")
     return 0
 
 
@@ -328,10 +364,52 @@ def _cmd_check(args: argparse.Namespace) -> int:
         meta.converged = False
         meta.convergence_note = f"reopened via human check #{check_id}"
         project.save_meta(meta)
+    elif args.result == "confirm_reframe_degraded":
+        # Gate (ii): only valid when Reframer failed >= 2 times and
+        # never succeeded. Refuse otherwise so users don't accidentally
+        # skip the structural-alternative coverage they still could have.
+        if meta.reframe_tested:
+            print(
+                "[pcd] error: reframe_tested is already True — no need "
+                "to confirm degraded gate",
+                file=sys.stderr,
+            )
+            return 1
+        if meta.reframe_attempts < 2:
+            print(
+                f"[pcd] error: confirm_reframe_degraded requires "
+                f"reframe_attempts >= 2 (currently {meta.reframe_attempts}). "
+                f"Let Reframer try its second attempt first.",
+                file=sys.stderr,
+            )
+            return 1
+        meta.reframe_degraded_confirmed = True
+        meta.convergence_note = (
+            f"reframe gate (ii) confirmed via human check #{check_id}"
+        )
+        project.save_meta(meta)
     # advisory_only: no meta change.
     print(
         f"[pcd] human check #{check_id} recorded at iteration "
         f"{meta.iterations_done}: result={args.result}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_guide(args: argparse.Namespace) -> int:
+    project = _load_project(args.project_name)
+    if project is None:
+        return 1
+    note = args.note.strip()
+    if not note:
+        print("[pcd] error: guidance note cannot be empty", file=sys.stderr)
+        return 1
+    gid = project.append_guidance(note)
+    pending = len(project.pending_guidance())
+    print(
+        f"[pcd] guidance #{gid} recorded; {pending} pending guidance "
+        f"will be included in the next Proposer revise",
         file=sys.stderr,
     )
     return 0
@@ -355,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         "run-until-stop": _cmd_run_until_stop,
         "status": _cmd_status,
         "check": _cmd_check,
+        "guide": _cmd_guide,
     }
     handler = dispatch.get(args.command)
     if handler is None:

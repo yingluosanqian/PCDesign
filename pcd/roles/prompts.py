@@ -70,7 +70,38 @@ above. Write the file using your filesystem tools, then briefly confirm.
 """
 
 
-def proposer_revise_prompt(issue_package_markdown: str) -> str:
+def proposer_revise_prompt(
+    issue_package_markdown: str,
+    guidance_markdown: str = "",
+) -> str:
+    guidance_block = ""
+    if guidance_markdown.strip():
+        guidance_block = f"""
+
+## User guidance (MUST acknowledge)
+
+The user has injected the following guidance for this revise, OUTSIDE
+the critic/Judge pipeline. You MUST acknowledge every item in a new
+Rationale subsection called `## User Guidance Received`, one entry
+per guidance with your explicit position:
+
+- **adopt** — you changed design.md in response to this guidance.
+  Briefly describe the change.
+- **partial_adopt** — you changed design.md only partially; note
+  what you absorbed and what you held back.
+- **decline** — you chose not to act on this guidance. Give a
+  first-principles reason that engages with the guidance directly.
+  "Out of scope" alone is insufficient unless you can cite the
+  specific constraint that makes it out of scope.
+
+User guidance is higher priority than critic/Judge issues: if a
+guidance conflicts with a `must_fix`, the guidance wins (the user
+has explicit override authority). Log that tension in the entry.
+
+<user_guidance>
+{guidance_markdown}
+</user_guidance>
+"""
     return f"""The Judge has produced a decision package based on reviews by up to
 five specialist critics (Requirement, Design, Rationale, and — on
 rounds where the Reframer fired — Reframer and Exploration). The
@@ -93,12 +124,29 @@ Special handling for clusters with `section: alternatives`:
   cluster with decision `must_fix` or `should_fix`: adopt (switch
   baseline to the alt), partial_adopt (absorb one idea), or reject
   (argue why baseline dominates).
+- **Steelman step — REQUIRED before writing your position.** For
+  each alt, before deciding to reject, spend 30 seconds fairly
+  summarizing what the alt would genuinely do BETTER than baseline
+  if it worked. Write this steelman in the entry ("Alt's strongest
+  case: …"). THEN argue why the baseline still wins. If the steelman
+  is "none, the alt is strictly worse", you haven't engaged — re-
+  read the alt's `key_invariant` and `tradeoff_vs_baseline` to find
+  at least one axis on which the alt legitimately claims an edge.
 - Your position goes in a dedicated Rationale subsection called
-  `## Rejected/Adopted Alternatives`, listing one entry per alt `id`
-  with your position and a one-to-three-sentence first-principles
-  argument. "Baseline is already justified" is NOT a sufficient
-  reject argument — you must engage the alt's `key_invariant`
-  directly and show on what specific axis baseline actually beats it.
+  `## Rejected/Adopted Alternatives`, one entry per alt `id`:
+  ```
+  ### alt-1 — <reject|partial_adopt|adopt>
+
+  **Alt's strongest case:** <1-2 sentences — the steelman>
+
+  **Why baseline still wins (or: what we're adopting):** <2-4
+  sentences — first-principles argument that engages the alt's
+  `key_invariant` directly, NOT "baseline is already justified">
+  ```
+- "Baseline is already justified" is NOT a sufficient reject
+  argument. Neither is "the alt has a worse cost profile" without
+  specifying the axis. Neither is a one-sentence dismissal of a
+  200-word sketch.
 - For `reject`-decision alternatives clusters, you may briefly note
   them as "Judge filtered; no engagement required" or skip entirely.
 
@@ -108,7 +156,7 @@ three-section format.
 <judge_issue_package>
 {issue_package_markdown}
 </judge_issue_package>
-
+{guidance_block}
 When done, briefly confirm the document has been updated.
 """
 
@@ -144,6 +192,46 @@ Document format you are reviewing:
 
 Be rigorous but constructive — you are a colleague, not an adversary.
 Prefer a few high-signal issues over a laundry list.
+
+## Verify-before-issue discipline — MANDATORY
+
+Before raising ANY issue, do this check:
+
+1. **Locate the exact passage** in ./design.md you're critiquing. Quote
+   it (or a short salient phrase from it) in the `evidence` field of
+   your issue. If you cannot find a specific passage to quote, the
+   issue is probably pattern-matched rather than read — do not raise it.
+
+2. **Check your own claim** against the passage. If you're asserting
+   "§X contradicts §Y", read §Y too and confirm the contradiction is
+   real text-vs-text, not a phantom inconsistency you imagined from
+   reading only §X. If you can't cite both, don't raise it.
+
+3. **Consider the delegation chain.** If §N says "this is decided by
+   §M" (e.g., "其角色集由 §M 确定", "实现细节见 §M"), don't fault §N
+   for "not specifying" the delegated content — §M is the right place
+   to critique. Raise it against §M or drop the issue.
+
+## What you would NOT raise — self-calibration
+
+Skip these categories entirely:
+
+- **Wordsmithing.** "This sentence would be clearer if reordered" —
+  not your job.
+- **Restatement.** Rephrasing what the doc says back as an objection
+  without adding new evidence.
+- **Pattern-match hallucinations.** "A doc like this usually addresses
+  X" — unless you can show the doc actually fails on X, skip.
+- **Pre-emptive speculation.** "Future readers might confuse A and B"
+  — only raise if the confusion has an operational consequence you
+  can name.
+- **Issues you would flag as `low` severity** if the doc is already at
+  production-quality rigor — prefer to let the author decide what's
+  worth the noise.
+
+High-signal issues vs. noise is your judgment. A round with 2-3 well-
+grounded `high`/`medium` issues is more useful than 10 `low` issues
+where half are pattern-matched.
 
 {CRITIC_OUTPUT_SPEC}
 """
@@ -366,6 +454,25 @@ Your job:
 3. CALIBRATE severity. The critics often inflate. Lower severity when
    evidence is weak; raise it when the issue clearly blocks the design.
 
+   **Reject (not downgrade) these issue patterns:**
+   - **Wordsmithing.** "§X would be clearer if phrased Y." The document
+     is at production-rigor level; stylistic preferences are noise.
+   - **Pattern-match hallucinations.** Critic asserts a contradiction
+     but didn't cite both sides (the `evidence` quotes only one §).
+     The critic saw a shape and imagined a defect.
+   - **Delegation-chain failures.** Critic faults §N for "not
+     specifying" content that §N explicitly delegates to §M. The fix
+     belongs against §M or nowhere.
+   - **Pre-emptive speculation.** "Future readers might…" without a
+     named operational consequence.
+   - **Issues the critic itself marked `low` severity** on a doc that
+     is otherwise rigorous — low-severity wordsmithing should not
+     graduate to `should_fix`.
+
+   Rejected clusters still get emitted (every input issue gets a
+   cluster), but with `decision: "reject"` and a brief `rationale`
+   explaining which pattern applied.
+
    For alternatives clusters specifically:
    - Raise severity if Exploration critic found an incoherence the
      Reframer missed AND the alt's dominance claim was non-trivial —
@@ -543,6 +650,37 @@ Procedure (MUST follow in this order):
    the hard_constraints, not FROM baseline.
 
 3. Generate alternatives via the cognitive moves below.
+
+4. **Self-check phase — MANDATORY before emitting.** For each
+   alternative you drafted:
+
+   (a) **Re-read its `constraint_accounting`.** For every
+       `treatment: "satisfied-by"` entry, ask: "If I actually built
+       this alt, would the mechanism I wrote in `how` REALLY satisfy
+       the constraint?" If you're not confident — demote to
+       `traded-away` (with honest justification) or drop the alt.
+
+   (b) **Re-read its `sketch`.** Find every verb phrase and ask: "Did
+       I name WHICH agent/file/mechanism does this, or did I hand-
+       wave with passive voice?" Rewrite every passive "X is
+       compiled", "Y is verified", "Z is coordinated" with an active
+       agent. If you can't name the actor, the mechanism isn't real.
+
+   (c) **Re-read the `tradeoff_vs_baseline`.** Is the dominance axis
+       OPERATIONALLY OBSERVABLE? ("More legible stop signal" fails —
+       subjective. "Cross-round regressions on stable obligation IDs
+       are detectable without re-running Judge" passes — has a test.)
+       If the dominance is aesthetic, either rewrite it to be
+       observable or drop the alt.
+
+   (d) **Compare `key_invariant` to baseline's equivalent**. Are
+       they different in kind (good), or is the alt's key_invariant
+       just "baseline's invariant but with different parameters"
+       (bad — that's parameter tuning, not reframing)? If the
+       latter, try a different cognitive move.
+
+   Alternatives that don't pass all four self-checks must be dropped.
+   Quality over quantity: 2 strong alts beat 4 weak ones.
 
 What you MUST NOT produce:
 - Parameter tunings of baseline ("same shape but N=5 instead of 3").

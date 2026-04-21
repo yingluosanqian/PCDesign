@@ -47,12 +47,15 @@ def run_proposer_revise(
     reasoning_effort: str = "medium",
     agent: str = "codex",
     on_progress: Optional[Callable[[str], None]] = None,
+    guidance_markdown: str = "",
 ) -> None:
     """Resume P's long session, apply the Judge's issue package, rewrite design.md.
 
     The issue package may contain `section="alternatives"` clusters
-    emitted by the Reframer + Exploration Critic; the Proposer's prompt
-    spells out how those are to be addressed (see prompts.py).
+    emitted by the Reframer + Exploration Critic. If `guidance_markdown`
+    is non-empty, the Proposer also sees user-injected guidance and
+    must acknowledge each item in Rationale's `## User Guidance
+    Received` subsection.
     """
     with make_agent_client(
         agent,
@@ -69,6 +72,8 @@ def run_proposer_revise(
             thread_id=thread_id,
             cwd=str(project_root),
             model=model,
-            prompt=proposer_revise_prompt(issue_package_markdown),
+            prompt=proposer_revise_prompt(
+                issue_package_markdown, guidance_markdown
+            ),
             on_progress=on_progress,
         )

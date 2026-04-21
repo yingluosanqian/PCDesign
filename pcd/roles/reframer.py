@@ -26,49 +26,49 @@ from typing import Callable, Optional
 
 from pcd.agents import make_agent_client
 from pcd.issues import alternatives_to_issues, parse_reframer_output
-from pcd.roles._guard import readonly_guarded
+from pcd.roles._guard import private_staging
 from pcd.roles.prompts import reframer_prompt
 
 
 def run_reframer(
     *,
     project_root: Path,
+    iteration: int,
     model: Optional[str],
     reasoning_effort: str = "medium",
     agent: str = "codex",
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> tuple[list[dict], dict, bool]:
-    """Run one fresh Reframer session.
+    """Run one fresh Reframer session in its private staging dir.
 
-    Returns `(issues, package, contaminated)` where:
-    - `issues` are critic-shape dicts with section="alternatives",
-      ready to drop into `critics_output["reframer"]` for Judge.
-    - `package` is the raw Reframer output: `{hard_constraints: [...],
-      alternatives: [...]}` — persisted to disk for human review and
-      consumed by the Exploration Critic on the same round.
-    - `contaminated` means the subprocess modified design.md and the
-      file has been restored from a pre-call snapshot.
+    Returns `(issues, package, contaminated)` — same contamination
+    semantics as the other read-only roles.
     """
-    def _body():
+    def _body(staging_dir: Path):
         with make_agent_client(
             agent,
-            cwd=str(project_root),
+            cwd=str(staging_dir),
             reasoning_effort=reasoning_effort,
         ) as client:
             thread_id = client.start_thread(
-                cwd=str(project_root),
+                cwd=str(staging_dir),
                 model=model,
                 sandbox="read-only",
             )
             return client.run_turn(
                 thread_id=thread_id,
-                cwd=str(project_root),
+                cwd=str(staging_dir),
                 model=model,
                 prompt=reframer_prompt(),
                 on_progress=on_progress,
             )
 
-    result, contaminated = readonly_guarded(project_root, _body)
+    result, contaminated = private_staging(
+        project_root=project_root,
+        iteration=iteration,
+        role_name="reframer",
+        body=_body,
+    )
     hard_constraints, alternatives = parse_reframer_output(result.final_text)
     package = {
         "hard_constraints": hard_constraints,

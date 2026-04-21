@@ -17,7 +17,26 @@ JUDGMENTS_LOG = "judgments.jsonl"
 REVISIONS_LOG = "revisions.jsonl"
 HUMAN_CHECKS_LOG = "human_checks.jsonl"
 ALTERNATIVES_LOG = "alternatives.jsonl"
+GUIDANCE_LOG = "guidance.jsonl"
 ROUNDS_DIR = "rounds"
+
+# Round lifecycle — one of these strings is written into
+# rounds/iter_NNN/STATUS at each milestone. On restart, the orchestrator
+# reads STATUS to skip already-completed expensive steps.
+STATUS_STARTED = "started"            # pre_critics snapshot written
+STATUS_CRITICS_DONE = "critics_done"  # all section critics + (maybe) reframer/exploration done
+STATUS_JUDGE_DONE = "judge_done"      # judgment.json written
+STATUS_JUDGED = "judged"              # manual-judge (if any) applied; judgment frozen
+STATUS_PROPOSER_DONE = "proposer_done"  # design.md rewrite complete
+STATUS_COMMITTED = "committed"        # jsonl appended, summary.md written
+STATUS_SEQUENCE = (
+    STATUS_STARTED,
+    STATUS_CRITICS_DONE,
+    STATUS_JUDGE_DONE,
+    STATUS_JUDGED,
+    STATUS_PROPOSER_DONE,
+    STATUS_COMMITTED,
+)
 
 
 @dataclass
@@ -42,8 +61,19 @@ class ProjectMeta:
     # reframe_at_round: scheduled trigger — Reframer fires once at or
     #   after this iteration. Default 2 (early, before Proposer has
     #   deeply committed to the current shape's refinement direction).
+    # reframe_attempts: number of times Reframer was invoked (success
+    #   or failure). Capped at 2; after that the Reframer stops trying
+    #   and the gate moves to "degraded" status. Prevents budget burn
+    #   when Reframer repeatedly fails.
+    # reframe_degraded_confirmed: human has acknowledged via
+    #   `pcd check --result confirm_reframe_degraded` that this run
+    #   will not receive structural-alternative coverage. Unlocks the
+    #   convergence gate under gate (ii). Only settable when
+    #   reframe_attempts >= 2 AND reframe_tested is still False.
     reframe_tested: bool = False
     reframe_at_round: int = 2
+    reframe_attempts: int = 0
+    reframe_degraded_confirmed: bool = False
     reframer_agent: str = "codex"
     reframer_model: Optional[str] = None
 
@@ -69,6 +99,7 @@ class Project:
         self.revisions_log_path = self.meta_dir / REVISIONS_LOG
         self.human_checks_log_path = self.meta_dir / HUMAN_CHECKS_LOG
         self.alternatives_log_path = self.meta_dir / ALTERNATIVES_LOG
+        self.guidance_log_path = self.meta_dir / GUIDANCE_LOG
         self.rounds_dir = self.meta_dir / ROUNDS_DIR
 
     def exists(self) -> bool:
@@ -189,6 +220,70 @@ class Project:
     def append_human_check(self, record: dict) -> None:
         self._append_jsonl(self.human_checks_log_path, record)
 
+    # ------------------------------------------------------------ guidance
+
+    def append_guidance(self, note: str) -> int:
+        """Record a user's one-liner guidance. Returns the new id.
+
+        The next Proposer revise will see all guidance records with
+        consumed_at_iteration == None, inject them into the revise
+        prompt, and mark them consumed after the revise succeeds.
+        """
+        entries = list(self._iter_guidance())
+        gid = len(entries) + 1
+        record = {
+            "id": gid,
+            "note": note,
+            "created_at": self.now_iso(),
+            "consumed_at_iteration": None,
+        }
+        self._append_jsonl(self.guidance_log_path, record)
+        return gid
+
+    def _iter_guidance(self) -> Iterator[dict]:
+        if not self.guidance_log_path.exists():
+            return
+        with self.guidance_log_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+    def pending_guidance(self) -> list[dict]:
+        """Guidance records the Proposer hasn't consumed yet."""
+        return [
+            g
+            for g in self._iter_guidance()
+            if g.get("consumed_at_iteration") is None
+        ]
+
+    def mark_guidance_consumed(self, iteration: int, ids: list[int]) -> None:
+        """Mark the given guidance ids as consumed in round `iteration`.
+
+        Rewrites the whole guidance.jsonl in-place. OK because the
+        guidance log stays small (one record per user hint; there
+        won't be thousands).
+        """
+        if not ids:
+            return
+        id_set = set(ids)
+        entries = list(self._iter_guidance())
+        for e in entries:
+            if (
+                e.get("id") in id_set
+                and e.get("consumed_at_iteration") is None
+            ):
+                e["consumed_at_iteration"] = iteration
+        self.guidance_log_path.write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in entries)
+            + ("\n" if entries else ""),
+            encoding="utf-8",
+        )
+
     def next_human_check_id(self) -> int:
         if not self.human_checks_log_path.exists():
             return 1
@@ -263,6 +358,132 @@ class Project:
         if not self.design_path.exists():
             return None
         return hashlib.sha256(self.design_path.read_bytes()).hexdigest()
+
+    # ------------------------------------------------------------ round STATUS
+
+    def _round_dir(self, iteration: int) -> Path:
+        path = self.rounds_dir / f"iter_{iteration:03d}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def write_round_status(self, iteration: int, status: str) -> None:
+        """Write (overwrite) the STATUS file for an iteration."""
+        (self._round_dir(iteration) / "STATUS").write_text(
+            status + "\n", encoding="utf-8"
+        )
+
+    def read_round_status(self, iteration: int) -> Optional[str]:
+        """Read the STATUS of an iteration's round dir, or None if no file."""
+        path = self.rounds_dir / f"iter_{iteration:03d}" / "STATUS"
+        if not path.exists():
+            return None
+        return path.read_text(encoding="utf-8").strip() or None
+
+    def persist_critic_output(
+        self, iteration: int, role: str, issues: list[dict]
+    ) -> None:
+        """Persist one critic's issues immediately after it returns.
+
+        `role` is the key the issues will occupy in critics_output
+        (e.g. "requirement", "design", "rationale", "reframer",
+        "exploration"). Crash-recovery reads these back.
+        """
+        (self._round_dir(iteration) / f"critic_{role}.json").write_text(
+            json.dumps(issues, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def load_critics_output_from_disk(
+        self, iteration: int, roles: Iterator[str]
+    ) -> dict[str, list[dict]]:
+        """Rebuild critics_output dict from per-role JSON files on disk.
+
+        Used when resuming from STATUS >= critics_done. Missing files
+        (e.g. a critic role that didn't run this iteration) are
+        represented as empty lists in the returned dict ONLY when the
+        caller's role list includes them; unknown extras are ignored.
+        """
+        out: dict[str, list[dict]] = {}
+        round_dir = self.rounds_dir / f"iter_{iteration:03d}"
+        for role in roles:
+            path = round_dir / f"critic_{role}.json"
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(data, list):
+                        out[role] = data
+                        continue
+                except json.JSONDecodeError:
+                    pass
+            out[role] = []
+        return out
+
+    def persist_reframer_package(self, iteration: int, package: dict) -> None:
+        """Persist the raw reframer package (hard_constraints + alternatives)."""
+        (self._round_dir(iteration) / "reframer_package.json").write_text(
+            json.dumps(package, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def load_reframer_package(self, iteration: int) -> Optional[dict]:
+        path = self.rounds_dir / f"iter_{iteration:03d}" / "reframer_package.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+
+    def persist_judgment(self, iteration: int, judgment: dict) -> None:
+        """Persist Judge's raw output immediately after Judge returns."""
+        (self._round_dir(iteration) / "judgment.json").write_text(
+            json.dumps(judgment, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def load_judgment_artifact(self, iteration: int) -> Optional[dict]:
+        path = self.rounds_dir / f"iter_{iteration:03d}" / "judgment.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+
+    def persist_round_flags(self, iteration: int, flags: dict) -> None:
+        """Persist round-level flags (critic_failures, contaminated lists,
+        reframer_fired, manually_edited) so recovery can restore them."""
+        (self._round_dir(iteration) / "round_flags.json").write_text(
+            json.dumps(flags, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def load_round_flags(self, iteration: int) -> Optional[dict]:
+        path = self.rounds_dir / f"iter_{iteration:03d}" / "round_flags.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+
+    def snapshot_design_pre_critics(self, iteration: int) -> Optional[Path]:
+        """Save the state of design.md at the START of a round.
+
+        Drops it at `.pcd/rounds/iter_NNN/design.pre_critics.md`. Used
+        as the round-level audit snapshot — if a private-staging
+        contamination triggers or if you want to diff "what critics
+        saw" vs "what Proposer produced", this is the canonical input.
+
+        Returns the snapshot path, or None if design.md doesn't exist.
+        """
+        if not self.design_path.exists():
+            return None
+        round_dir = self.rounds_dir / f"iter_{iteration:03d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        snapshot = round_dir / "design.pre_critics.md"
+        snapshot.write_bytes(self.design_path.read_bytes())
+        return snapshot
 
     @staticmethod
     def _append_jsonl(path: Path, record: Any) -> None:

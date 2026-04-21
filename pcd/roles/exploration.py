@@ -27,43 +27,48 @@ from typing import Callable, Optional
 
 from pcd.agents import make_agent_client
 from pcd.issues import parse_critic_issues
-from pcd.roles._guard import readonly_guarded
+from pcd.roles._guard import private_staging
 from pcd.roles.prompts import exploration_critic_prompt
 
 
 def run_exploration_critic(
     *,
     project_root: Path,
+    iteration: int,
     reframer_package: dict,
     model: Optional[str],
     reasoning_effort: str = "medium",
     agent: str = "codex",
     on_progress: Optional[Callable[[str], None]] = None,
 ) -> tuple[list[dict], bool]:
-    """Run one fresh Exploration Critic session.
+    """Run one fresh Exploration Critic session in its private staging dir.
 
     `reframer_package` is the raw `{hard_constraints, alternatives}`
-    dict from `run_reframer`. Returns `(issues, contaminated)` with
-    issues having `section="alternatives"` and `critic_role="exploration"`.
+    dict from `run_reframer`. Returns `(issues, contaminated)`.
     """
-    def _body():
+    def _body(staging_dir: Path):
         with make_agent_client(
             agent,
-            cwd=str(project_root),
+            cwd=str(staging_dir),
             reasoning_effort=reasoning_effort,
         ) as client:
             thread_id = client.start_thread(
-                cwd=str(project_root),
+                cwd=str(staging_dir),
                 model=model,
                 sandbox="read-only",
             )
             return client.run_turn(
                 thread_id=thread_id,
-                cwd=str(project_root),
+                cwd=str(staging_dir),
                 model=model,
                 prompt=exploration_critic_prompt(reframer_package),
                 on_progress=on_progress,
             )
 
-    result, contaminated = readonly_guarded(project_root, _body)
+    result, contaminated = private_staging(
+        project_root=project_root,
+        iteration=iteration,
+        role_name="exploration",
+        body=_body,
+    )
     return parse_critic_issues("exploration", result.final_text), contaminated
