@@ -36,16 +36,13 @@ class ProjectMeta:
     critic_agent: str = "codex"
     judge_agent: str = "codex"
     # Reframer (alternative-generator) state. See pcd/roles/reframer.py.
-    # reframe_tested: at least one Proposer revise has processed an
-    #   alternatives package. Blocks convergence until True.
-    # reframe_pending: alternatives have been logged but not yet consumed
-    #   by a Proposer revise. Forces the next Proposer call regardless of
-    #   the normal quality_ok/stable branching.
-    # reframe_at_round: scheduled trigger — Reframer runs once at the end
-    #   of this iteration if still untested. Default 2 (after Proposer's
-    #   first real revision, when Proposer hasn't yet deeply committed).
+    # reframe_tested: Reframer has fired at least once in this run, its
+    #   issues flowed through Judge, and the Proposer's revise consumed
+    #   the resulting package. Blocks convergence until True.
+    # reframe_at_round: scheduled trigger — Reframer fires once at or
+    #   after this iteration. Default 2 (early, before Proposer has
+    #   deeply committed to the current shape's refinement direction).
     reframe_tested: bool = False
-    reframe_pending: bool = False
     reframe_at_round: int = 2
     reframer_agent: str = "codex"
     reframer_model: Optional[str] = None
@@ -157,26 +154,25 @@ class Project:
         *,
         iteration: int,
         alternatives: list[dict],
-        trigger: str,
+        hard_constraints: list[str] | None = None,
+        trigger: str = "scheduled",
     ) -> Path:
         """Log a Reframer-produced alternatives package.
 
-        `trigger` names the reason we ran Reframer this round: "scheduled"
-        (iteration == reframe_at_round) or "converge_gate" (we'd have
-        declared converged but reframe_tested was still False). Kept on
-        the record so you can eyeball "why this alt package exists" later.
-
-        Also writes the rounds/iter_NNN/alternatives.md sibling so
-        humans can skim the package without spelunking the jsonl.
+        `trigger` names the reason we ran Reframer this round (currently
+        always "scheduled"). Also writes the rounds/iter_NNN/alternatives.md
+        sibling so humans can skim the package without spelunking jsonl.
         Returns the markdown path.
         """
         # Local import avoids project ← issues import cycle.
         from pcd.issues import format_alternatives_summary
 
+        hc = list(hard_constraints or [])
         record = {
             "iteration": iteration,
             "timestamp": self.now_iso(),
             "trigger": trigger,
+            "hard_constraints": hc,
             "alternatives": alternatives,
         }
         self._append_jsonl(self.alternatives_log_path, record)
@@ -184,29 +180,11 @@ class Project:
         round_dir = self.rounds_dir / f"iter_{iteration:03d}"
         round_dir.mkdir(parents=True, exist_ok=True)
         md_path = round_dir / "alternatives.md"
-        md_body = format_alternatives_summary(alternatives)
+        md_body = format_alternatives_summary(alternatives, hc)
         md_path.write_text(
             f"<!-- trigger: {trigger} -->\n\n{md_body}", encoding="utf-8"
         )
         return md_path
-
-    def last_pending_alternatives(self) -> Optional[dict]:
-        """The most recent alternatives record — interpreted as 'pending'
-        by the orchestrator based on meta.reframe_pending, not by the file
-        itself. Returns the record dict or None if nothing has been logged."""
-        last: Optional[dict] = None
-        if not self.alternatives_log_path.exists():
-            return None
-        with self.alternatives_log_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    last = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-        return last
 
     def append_human_check(self, record: dict) -> None:
         self._append_jsonl(self.human_checks_log_path, record)

@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
 from pcd.issues import (
-    format_alternatives_for_proposer,
     format_issue_package_for_proposer,
     is_converged,
     is_stable,
@@ -20,6 +19,7 @@ from pcd.project import Project
 from pcd.roles import (
     CRITIC_ROLES,
     run_critic,
+    run_exploration_critic,
     run_judge,
     run_proposer_revise,
     run_reframer,
@@ -104,9 +104,112 @@ def run_single_iteration(
                 critics_output[role] = []
                 critic_failures.append(role)
 
+    # ---- Reframer / Exploration critics (conditional on trigger) ----
+    # Reframer fires at most once per `run-until-stop`, gated by
+    # meta.reframe_tested. Trigger: iteration >= meta.reframe_at_round
+    # AND not yet tested. Its output flows through the Judge just like
+    # the other three critics — critic → judge → proposer is a single
+    # unified pipeline. Exploration critic runs on the same round,
+    # sequentially after Reframer (it needs the Reframer package).
+    #
+    # No converge-gate here: the gate lives in run_until_stop, which
+    # refuses to exit on converged while reframe_tested is still False.
+    # Default reframe_at_round=2 means Reframer fires at iter 2 on
+    # every project, long before any sane convergence can happen.
+    reframer_fired = False
+    reframer_trigger = ""
+    exploration_contaminated = False
+    if not meta.reframe_tested and iteration >= meta.reframe_at_round:
+        reframer_trigger = "scheduled"
+        print(
+            f"[pcd] iter {iteration}: Reframer firing "
+            f"(trigger={reframer_trigger})",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            reframer_issues, reframer_package, reframer_contaminated = run_reframer(
+                project_root=project.root,
+                model=reframer_model,
+                reasoning_effort=reframer_reasoning,
+                agent=reframer_agent,
+                on_progress=_make_role_progress(
+                    f"iter {iteration} reframer"
+                ),
+            )
+            reframer_fired = True
+            critics_output["reframer"] = reframer_issues
+            alt_path = project.append_alternatives(
+                iteration=iteration,
+                alternatives=reframer_package.get("alternatives") or [],
+                hard_constraints=reframer_package.get("hard_constraints") or [],
+                trigger=reframer_trigger,
+            )
+            print(
+                f"[pcd] iter {iteration}: Reframer produced "
+                f"{len(reframer_issues)} alternative(s); dumped to {alt_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if reframer_contaminated:
+                contaminated_critics.append("reframer")
+                print(
+                    f"[pcd] iter {iteration}: reframer wrote design.md; "
+                    f"rolled back from snapshot",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+            # Exploration critic runs sequentially after Reframer —
+            # it audits the Reframer package and needs it as input.
+            print(
+                f"[pcd] iter {iteration}: Exploration critic auditing "
+                f"Reframer package",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                exploration_issues, exploration_contaminated = run_exploration_critic(
+                    project_root=project.root,
+                    reframer_package=reframer_package,
+                    model=reframer_model,
+                    reasoning_effort=reframer_reasoning,
+                    agent=reframer_agent,
+                    on_progress=_make_role_progress(
+                        f"iter {iteration} exploration"
+                    ),
+                )
+                critics_output["exploration"] = exploration_issues
+                if exploration_contaminated:
+                    contaminated_critics.append("exploration")
+                    print(
+                        f"[pcd] iter {iteration}: exploration critic wrote "
+                        f"design.md; rolled back from snapshot",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            except Exception as e:
+                print(
+                    f"[pcd] iter {iteration}: Exploration critic failed: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                critic_failures.append("exploration")
+                critics_output["exploration"] = []
+        except Exception as e:
+            print(
+                f"[pcd] iter {iteration}: Reframer failed: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            critic_failures.append("reframer")
+            critics_output["reframer"] = []
+
+    # ---- Judge (now possibly on 5 critic inputs) ---------------------
     total_issues = sum(len(v) for v in critics_output.values())
     print(
-        f"[pcd] iter {iteration}: critics produced {total_issues} raw issues; judging",
+        f"[pcd] iter {iteration}: {len(critics_output)} critics produced "
+        f"{total_issues} raw issues; judging",
         file=sys.stderr,
         flush=True,
     )
@@ -149,136 +252,47 @@ def run_single_iteration(
     if judge_contaminated:
         degraded_reasons.append("judge modified design.md (rolled back)")
     degraded = bool(degraded_reasons)
-    would_converge = quality_ok and stable and not degraded
+    # Convergence now requires reframe_tested too — but since Reframer
+    # fires this round if not yet tested, reframe_tested is read AFTER
+    # we've decided whether this round fires it. If Reframer fired this
+    # round, reframe_tested is about-to-be-True.
+    reframe_gate_ok = meta.reframe_tested or reframer_fired
+    converged = quality_ok and stable and not degraded and reframe_gate_ok
     print(
         f"[pcd] iter {iteration}: summary {summary}; "
         f"quality_ok={quality_ok} stable={stable} "
-        f"degraded={degraded} would_converge={would_converge}",
+        f"degraded={degraded} reframe_gate_ok={reframe_gate_ok} "
+        f"converged={converged}",
         file=sys.stderr,
         flush=True,
     )
 
-    # ---- Reframer trigger ---------------------------------------------
-    # Reframer fires at most once per `run-until-stop`, gated by
-    # `meta.reframe_tested`. Two triggers (OR):
-    #   (a) scheduled: the first iteration >= meta.reframe_at_round.
-    #   (b) converge gate: we would claim converged this round, but
-    #       reframe_tested is still False. We must not let the loop
-    #       declare converged without having ever been challenged.
-    # If reframe_pending is carried over from a prior (interrupted)
-    # round, skip re-running and consume the existing alternatives.
-    incoming_pending = bool(meta.reframe_pending)
-    alternatives_for_revise: Optional[list[dict]] = None
-    reframer_fired = False
-    reframer_trigger = ""
-    if incoming_pending:
-        pending_rec = project.last_pending_alternatives()
-        if pending_rec:
-            alternatives_for_revise = pending_rec.get("alternatives") or []
-            reframer_trigger = "resumed_pending"
-            print(
-                f"[pcd] iter {iteration}: resuming pending Reframer package "
-                f"from iter {pending_rec.get('iteration')}",
-                file=sys.stderr,
-                flush=True,
-            )
-    elif not meta.reframe_tested:
-        should_fire = (
-            iteration >= meta.reframe_at_round
-            or would_converge
-        )
-        if should_fire:
-            reframer_trigger = (
-                "converge_gate" if would_converge else "scheduled"
-            )
-            print(
-                f"[pcd] iter {iteration}: Reframer firing "
-                f"(trigger={reframer_trigger})",
-                file=sys.stderr,
-                flush=True,
-            )
-            try:
-                alts, reframer_contaminated = run_reframer(
-                    project_root=project.root,
-                    model=reframer_model,
-                    reasoning_effort=reframer_reasoning,
-                    agent=reframer_agent,
-                    on_progress=_make_role_progress(
-                        f"iter {iteration} reframer"
-                    ),
-                )
-                reframer_fired = True
-                alternatives_for_revise = alts
-                alt_path = project.append_alternatives(
-                    iteration=iteration,
-                    alternatives=alts,
-                    trigger=reframer_trigger,
-                )
-                print(
-                    f"[pcd] iter {iteration}: Reframer produced "
-                    f"{len(alts)} alternative(s); dumped to {alt_path}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                if reframer_contaminated:
-                    degraded_reasons.append(
-                        "reframer modified design.md (rolled back)"
-                    )
-                    degraded = True
-                # Persist reframe_pending BEFORE attempting revise so a
-                # crash between here and the revise still leaves the
-                # alts addressable on retry.
-                meta.reframe_pending = True
-                project.save_meta(meta)
-            except Exception as e:
-                print(
-                    f"[pcd] iter {iteration}: Reframer failed: {e}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                degraded_reasons.append(f"reframer failed: {e}")
-                degraded = True
-                alternatives_for_revise = None
-
-    has_alts = alternatives_for_revise is not None
-    # A round that just ran Reframer cannot itself declare converged —
-    # convergence must wait until the Proposer has responded to the
-    # alternatives at least once (reframe_tested=True).
-    converged = would_converge and not has_alts and not degraded
-
     revise_note = ""
-    revise_used_alternatives = False
-    if degraded and not has_alts:
+    if degraded:
         revise_note = (
             "degraded — no revise (" + "; ".join(degraded_reasons) + ")"
         )
     elif converged:
         revise_note = "converged — no revise"
-    elif quality_ok and not stable and not has_alts:
+    elif quality_ok and stable and not reframe_gate_ok:
+        # Should not happen in practice — if quality_ok and stable and
+        # Reframer didn't fire, reframe_at_round must be set absurdly
+        # high. Force a revise anyway so the loop doesn't stall silently.
+        revise_note = (
+            "quality ok but reframe gate not satisfied — revising anyway"
+        )
+    elif quality_ok and not stable:
         # Clean round but no stability evidence yet — skip revise; next
         # round will supply the comparison. Avoids wasting a P call on
         # an empty package.
         revise_note = "quality ok, awaiting stability — no revise"
     else:
+        print(
+            f"[pcd] iter {iteration}: proposer revising with judge package",
+            file=sys.stderr,
+            flush=True,
+        )
         issue_package_md = format_issue_package_for_proposer(judgment)
-        if has_alts:
-            print(
-                f"[pcd] iter {iteration}: proposer revising with judge "
-                f"package + {len(alternatives_for_revise)} alternative(s)",
-                file=sys.stderr,
-                flush=True,
-            )
-            alternatives_md = format_alternatives_for_proposer(
-                alternatives_for_revise
-            )
-            revise_used_alternatives = True
-        else:
-            print(
-                f"[pcd] iter {iteration}: proposer revising with judge package",
-                file=sys.stderr,
-                flush=True,
-            )
-            alternatives_md = None
         before_hash = project.design_hash()
         run_proposer_revise(
             project_root=project.root,
@@ -288,7 +302,6 @@ def run_single_iteration(
             reasoning_effort=proposer_reasoning,
             agent=proposer_agent,
             on_progress=_make_role_progress(f"iter {iteration} proposer"),
-            alternatives_markdown=alternatives_md,
         )
         after_hash = project.design_hash()
         if (
@@ -306,12 +319,11 @@ def run_single_iteration(
                 flush=True,
             )
         else:
-            revise_note = (
-                "revised with alternatives" if has_alts else "revised"
-            )
+            revise_note = "revised"
 
     convergence_note = _describe_convergence(
-        summary, quality_ok, stable, degraded, degraded_reasons
+        summary, quality_ok, stable, degraded, degraded_reasons,
+        reframe_gate_ok,
     )
 
     project.append_judgment(
@@ -339,14 +351,12 @@ def run_single_iteration(
     meta.iterations_done = iteration
     meta.converged = converged
     meta.convergence_note = convergence_note
-    if revise_used_alternatives:
-        # Proposer has just consumed a Reframer package; the "have we
-        # ever been challenged" gate is now satisfied for the rest of
-        # this run. reframe_pending clears because the alts are
-        # addressed in-doc (Rationale gained a Rejected/Adopted
-        # Alternatives subsection) — we don't need to re-feed them.
+    if reframer_fired:
+        # Reframer fired this round; its issues flowed through Judge
+        # like any other critic, and the Proposer's revise (above)
+        # consumed the resulting package. reframe_tested now holds for
+        # the rest of this run — the convergence gate is satisfied.
         meta.reframe_tested = True
-        meta.reframe_pending = False
     project.save_meta(meta)
     project.append_revision(iteration=iteration, note=revise_note)
     return judgment
@@ -406,6 +416,15 @@ def run_until_stop(
         file=sys.stderr,
         flush=True,
     )
+    if not project.load_meta().reframe_tested:
+        print(
+            "[pcd] note: Reframer never fired in this run (reframe_tested "
+            "still False). Set --max-iter higher or lower meta.reframe_at_round "
+            "so structurally-different alternatives get a chance to challenge "
+            "the current design.",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _make_role_progress(role_label: str) -> Callable[[str], None]:
@@ -432,6 +451,7 @@ def _describe_convergence(
     stable: bool,
     degraded: bool,
     degraded_reasons: list[str],
+    reframe_gate_ok: bool,
 ) -> str:
     base = (
         f"must_fix={summary.get('must_fix_count', 0)}, "
@@ -441,8 +461,13 @@ def _describe_convergence(
     if degraded:
         reasons = "; ".join(degraded_reasons) or "unspecified"
         return f"degraded: {reasons}; {base}"
-    if quality_ok and stable:
+    if quality_ok and stable and reframe_gate_ok:
         return f"converged: {base}"
+    if quality_ok and stable and not reframe_gate_ok:
+        return (
+            f"quality ok + stable but Reframer has not yet fired "
+            f"(reframe_at_round not reached): {base}"
+        )
     if quality_ok and not stable:
         return f"quality ok but stability not yet established: {base}"
     return f"not converged: {base}"

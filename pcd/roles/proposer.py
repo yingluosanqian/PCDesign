@@ -5,11 +5,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from pcd.agents import make_agent_client
-from pcd.roles.prompts import (
-    proposer_create_prompt,
-    proposer_revise_prompt,
-    proposer_revise_with_alternatives_prompt,
-)
+from pcd.roles.prompts import proposer_create_prompt, proposer_revise_prompt
 
 
 def run_proposer_create(
@@ -51,13 +47,12 @@ def run_proposer_revise(
     reasoning_effort: str = "medium",
     agent: str = "codex",
     on_progress: Optional[Callable[[str], None]] = None,
-    alternatives_markdown: Optional[str] = None,
 ) -> None:
     """Resume P's long session, apply the Judge's issue package, rewrite design.md.
 
-    When `alternatives_markdown` is provided, the Proposer uses the
-    Reframer-aware prompt: it must take an explicit position on every
-    alternative and record its reasoning in a new Rationale subsection.
+    The issue package may contain `section="alternatives"` clusters
+    emitted by the Reframer + Exploration Critic; the Proposer's prompt
+    spells out how those are to be addressed (see prompts.py).
     """
     with make_agent_client(
         agent,
@@ -70,16 +65,10 @@ def run_proposer_revise(
             model=model,
             sandbox="workspace-write",
         )
-        if alternatives_markdown is not None:
-            prompt = proposer_revise_with_alternatives_prompt(
-                issue_package_markdown, alternatives_markdown
-            )
-        else:
-            prompt = proposer_revise_prompt(issue_package_markdown)
         client.run_turn(
             thread_id=thread_id,
             cwd=str(project_root),
             model=model,
-            prompt=prompt,
+            prompt=proposer_revise_prompt(issue_package_markdown),
             on_progress=on_progress,
         )

@@ -156,66 +156,72 @@ They still appear in `.pcd/judgments.jsonl`, `.pcd/rounds/iter_NNN/`,
 and `pcd status` — tagged with `degraded: true` plus a `degraded_reasons`
 list explaining why.
 
-### Reframer
+### Reframer and Exploration critic
 
-The critic / Judge pipeline is a refinement loop: critics find flaws,
-Judge merges them, Proposer fixes them. Refinement keeps the current
-design shape and tightens it. It does not explore alternative shapes —
-a local optimum in a narrow corner of design space will pass all
-critics and declare converged. The **Reframer** is PCDesign's
-exploration primitive: a separate role whose only job is to generate
-structurally-different alternative designs.
+The three section critics (requirement / design / rationale) run a
+refinement loop: they find flaws in the current design, Judge merges
+them, Proposer fixes them. Refinement keeps the current shape and
+tightens it — it does NOT explore alternative shapes. A local optimum
+in a narrow corner of design space will pass all three critics and
+declare converged.
 
-Unlike critics, Reframer:
+PCDesign's exploration primitive is a pair of additional critics that
+fire together, once per `run-until-stop`, gated by
+`meta.reframe_tested`:
 
-- Reads the **original** requirement (`.pcd/initial_prompt.txt`) rather
-  than starting from the current `design.md`. The current design is
-  reference only.
-- Is explicitly required to pick **at least 2 of 6 cognitive moves** —
-  *analogy*, *inversion*, *minimalization*, *rederivation*,
-  *requirement_pushback*, *scale_extrapolation* — and produce one
-  alternative per move. Each alternative must be a structurally
-  different skeleton, not a parameter tuning of the current design.
-- Outputs `alternatives.jsonl` (one record per Reframer run) and a
-  per-round markdown summary at `.pcd/rounds/iter_NNN/alternatives.md`.
+**Reframer** — generator.
+- Reads `.pcd/initial_prompt.txt` (the ORIGINAL requirement) and
+  enumerates hard constraints from it.
+- Proposes `>=2` structurally-different alternatives, each tagged with
+  one of six cognitive moves (*analogy*, *inversion*,
+  *minimalization*, *rederivation*, *requirement_pushback*,
+  *scale_extrapolation*).
+- Each alternative's sketch specifies concrete mechanisms — hand-waves
+  ("a coordinator ensures X") are forbidden by the Reframer prompt.
+- Each alternative carries a `constraint_accounting` table: for every
+  hard constraint, either `satisfied-by` with mechanism, or
+  `traded-away` with justification. An alternative that can't account
+  for a constraint is dropped before emission.
+- Output: one critic-shape issue per alternative, with
+  `section="alternatives"` and the sketch as evidence. Flows into the
+  same Judge as the three section critics.
 
-**When Reframer runs (at most once per `run-until-stop` invocation,
-gated by `meta.reframe_tested`):**
+**Exploration critic** — discriminator for the Reframer's output.
+- Reads `.pcd/initial_prompt.txt`, `./design.md`, and the Reframer
+  package.
+- Audits each alternative on four axes: requirement fit, internal
+  coherence, operationally-observable dominance claim, and
+  falsifiable failure mode addressed vs baseline.
+- Also raises `severity=high` if the Reframer's own hard-constraint
+  enumeration missed a constraint from initial_prompt.
+- Output: standard critic issues with `section="alternatives"`.
 
-- **Scheduled trigger**: at the first iteration `>=
-  meta.reframe_at_round` (default `2`). Fires early so the Proposer
-  hasn't yet deeply committed to the current shape's refinement
-  direction.
-- **Converge gate**: if the round would otherwise declare converged
-  but `reframe_tested` is still False, Reframer fires instead and
-  convergence is deferred. This guarantees no run can claim
-  convergence without ever being structurally challenged.
+**Judge handles both** — clusters per-alt (all issues about
+`alt-1` go into one cluster whether they came from Reframer or
+Exploration). Decisions: `must_fix` for alts that are coherent +
+grounded + claim non-trivial dominance; `reject` for alts Exploration
+demolished; `should_fix` / `defer` in between.
 
-**What happens after Reframer fires:**
+**Proposer** (single, unified prompt — no dual path) reads the Judge
+package. For every `section=alternatives` cluster with decision
+`must_fix` or `should_fix`, it adds an entry to a new Rationale
+subsection `## Rejected/Adopted Alternatives` with an explicit
+position (adopt / partial_adopt / reject) and a first-principles
+argument. "Baseline is already justified" is NOT a sufficient reject
+argument — the Rationale critic explicitly flags that pattern in
+subsequent rounds.
 
-1. Alternatives are logged to `alternatives.jsonl` and the per-round
-   markdown.
-2. `meta.reframe_pending` is set to `true` and persisted before the
-   Proposer revise starts — so a crash between Reframer and revise is
-   recoverable (next invocation consumes the pending alts instead of
-   re-running Reframer).
-3. The Proposer's revise this round is forced (even if the Judge's
-   package was empty). The Proposer receives the Judge package AND the
-   alternatives, and must take an **explicit position** on each
-   alternative — *adopt* (swap / blend), *partial_adopt* (absorb one
-   idea), or *reject* (argue why baseline beats it).
-4. The Proposer's Rationale gains a `Rejected/Adopted Alternatives`
-   subsection that records every position for future critics to read.
-5. `meta.reframe_tested` is set to `true`; `reframe_pending` clears.
-   Future rounds can now declare convergence on the normal path.
+**Trigger**: `iteration >= meta.reframe_at_round AND NOT
+meta.reframe_tested`. Default `reframe_at_round=2` fires Reframer
+after Proposer's first real revision. After firing, `reframe_tested`
+becomes True and Reframer won't fire again this run.
 
-This costs +1 agent call per `run-until-stop` and forces an extra
-Proposer revise. In exchange, a converged PCDesign design.md has
-been explicitly compared against at least one structurally-different
-alternative, and the Rationale carries the explicit argument for why
-that alternative was rejected (or adopted).
+**Convergence rule gains a fourth clause**: `reframe_tested=True`.
+`run-until-stop` also won't silently exit on `max-iter` without
+warning if Reframer never fired (either raise `--max-iter` or lower
+`meta.reframe_at_round`).
 
-Per-role configuration mirrors the other agents:
+Per-role configuration:
 
 ```bash
 pcd init myproj --prompt-file brief.md \
@@ -226,6 +232,9 @@ pcd init myproj --prompt-file brief.md \
 pcd run-until-stop myproj --max-iter 5 \
   --reframer-reasoning high        # default: medium
 ```
+
+The Reframer and Exploration critic share the `--reframer-*` knobs
+(they are a pair).
 
 ### Example
 

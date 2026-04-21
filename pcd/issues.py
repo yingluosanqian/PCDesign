@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 VALID_SEVERITIES = ("high", "medium", "low")
 VALID_DECISIONS = ("must_fix", "should_fix", "reject", "defer")
+VALID_SECTIONS = ("requirement", "solution", "rationale", "alternatives")
 VALID_COGNITIVE_MOVES = (
     "analogy",
     "inversion",
@@ -101,69 +102,143 @@ def parse_critic_issues(role: str, text: str) -> list[dict]:
     return issues
 
 
-def parse_alternatives(text: str) -> list[dict]:
-    """Normalize a Reframer's raw response into a list of alternative dicts.
+def parse_reframer_output(text: str) -> tuple[list[str], list[dict]]:
+    """Normalize a Reframer's raw response.
 
-    Each alt preserves id / cognitive_move / one_line / key_invariant /
-    tradeoff_vs_baseline / sketch. Invalid cognitive_moves fall back to
-    "rederivation" (the most generic one) with a record of the bad value
-    in `invalid_cognitive_move_raw` so we can tell the LLM tagged it
-    badly vs. really did a rederivation.
+    Returns `(hard_constraints, alternatives)` where hard_constraints
+    is the Reframer's enumeration of constraints from initial_prompt,
+    and alternatives is a list of alt dicts.
     """
     data = extract_json(text)
-    if isinstance(data, dict) and "alternatives" in data:
-        data = data["alternatives"]
-    if not isinstance(data, list):
-        raise ValueError("reframer output is not a JSON array of alternatives")
-    out: list[dict] = []
-    for i, raw in enumerate(data):
+    if not isinstance(data, dict):
+        raise ValueError("reframer output is not a JSON object")
+
+    raw_constraints = data.get("hard_constraints") or []
+    if not isinstance(raw_constraints, list):
+        raw_constraints = []
+    constraints: list[str] = [str(c) for c in raw_constraints if c]
+
+    raw_alts = data.get("alternatives")
+    if not isinstance(raw_alts, list):
+        raise ValueError("reframer output 'alternatives' is not a list")
+
+    alts: list[dict] = []
+    for i, raw in enumerate(raw_alts):
         if not isinstance(raw, dict):
             continue
         move_raw = str(raw.get("cognitive_move") or "")
         move = move_raw if move_raw in VALID_COGNITIVE_MOVES else "rederivation"
+        ca_raw = raw.get("constraint_accounting") or []
+        constraint_accounting: list[dict] = []
+        if isinstance(ca_raw, list):
+            for ca in ca_raw:
+                if not isinstance(ca, dict):
+                    continue
+                constraint_accounting.append(
+                    {
+                        "constraint": str(ca.get("constraint") or ""),
+                        "treatment": str(ca.get("treatment") or ""),
+                        "how": str(ca.get("how") or ""),
+                    }
+                )
         entry: dict = {
             "id": str(raw.get("id") or f"alt-{i+1}"),
             "cognitive_move": move,
             "one_line": str(raw.get("one_line") or "unspecified"),
             "key_invariant": str(raw.get("key_invariant") or ""),
             "tradeoff_vs_baseline": str(raw.get("tradeoff_vs_baseline") or ""),
+            "constraint_accounting": constraint_accounting,
             "sketch": str(raw.get("sketch") or ""),
         }
         if move != move_raw:
             entry["invalid_cognitive_move_raw"] = move_raw
-        out.append(entry)
+        alts.append(entry)
+    return constraints, alts
+
+
+def alternatives_to_issues(
+    alternatives: list[dict], hard_constraints: list[str]
+) -> list[dict]:
+    """Convert Reframer-produced alternatives into critic-shape issues.
+
+    Each alt becomes one issue with section="alternatives". The issue
+    is not a bug report; it is a directive: "engage with this alt in
+    your Rationale's Rejected/Adopted Alternatives subsection." Severity
+    starts at medium; the Judge recalibrates after seeing the
+    Exploration Critic's take on the alt's coherence.
+    """
+    out: list[dict] = []
+    for a in alternatives:
+        evidence_lines = [
+            f"cognitive_move: {a.get('cognitive_move', '?')}",
+            f"key_invariant: {a.get('key_invariant', '')}",
+            f"tradeoff_vs_baseline: {a.get('tradeoff_vs_baseline', '')}",
+        ]
+        ca = a.get("constraint_accounting") or []
+        if ca:
+            evidence_lines.append("constraint_accounting:")
+            for c in ca:
+                evidence_lines.append(
+                    f"  - [{c.get('treatment', '?')}] "
+                    f"{c.get('constraint', '?')} — {c.get('how', '')}"
+                )
+        if a.get("sketch"):
+            evidence_lines.append("")
+            evidence_lines.append("sketch:")
+            evidence_lines.append(a["sketch"])
+        out.append(
+            {
+                "id": str(a.get("id") or "alt-?"),
+                "critic_role": "reframer",
+                "section": "alternatives",
+                "location": "(whole design; alternative skeleton)",
+                "root_problem": (
+                    f"Baseline may be dominated by alt {a.get('id', '?')} "
+                    f"({a.get('cognitive_move', '?')}): "
+                    f"{a.get('one_line', '')}"
+                ),
+                "severity": "medium",
+                "evidence": "\n".join(evidence_lines),
+                "suggested_direction": (
+                    "Take an explicit position in Rationale's "
+                    "`Rejected/Adopted Alternatives` subsection: adopt / "
+                    "partial_adopt / reject. Reject arguments MUST be "
+                    "first-principles (engage the alt's key_invariant "
+                    "directly); appeals to baseline's prior rationale "
+                    "alone are insufficient."
+                ),
+            }
+        )
     return out
 
 
-def format_alternatives_for_proposer(alternatives: list[dict]) -> str:
-    """Render alternatives as a markdown block for the Proposer's prompt."""
+def format_alternatives_summary(
+    alternatives: list[dict],
+    hard_constraints: list[str] | None = None,
+) -> str:
+    """Render a Reframer package as a standalone markdown summary for
+    rounds/iter_NNN/alternatives.md."""
+    hc = hard_constraints or []
     if not alternatives:
-        return "_(Reframer produced no alternatives this round.)_"
-    lines: list[str] = [f"Reframer produced {len(alternatives)} alternative(s)."]
-    for a in alternatives:
-        lines.append("")
-        lines.append(
-            f"### `{a['id']}` — {a.get('cognitive_move', '?')}"
-        )
-        lines.append(f"**One-line**: {a.get('one_line', '')}")
-        if a.get("key_invariant"):
-            lines.append(f"**Key invariant vs baseline**: {a['key_invariant']}")
-        if a.get("tradeoff_vs_baseline"):
-            lines.append(
-                f"**Trade-off vs baseline**: {a['tradeoff_vs_baseline']}"
+        body = "_No alternatives produced this round._\n"
+        if hc:
+            body = (
+                "## Reframer-extracted hard constraints\n\n"
+                + "\n".join(f"- {c}" for c in hc)
+                + "\n\n"
+                + body
             )
-        if a.get("sketch"):
-            lines.append("")
-            lines.append("**Sketch:**")
-            lines.append(a["sketch"])
-    return "\n".join(lines)
+        return body
 
+    lines: list[str] = []
+    if hc:
+        lines.append("## Reframer-extracted hard constraints")
+        lines.append("")
+        for c in hc:
+            lines.append(f"- {c}")
+        lines.append("")
 
-def format_alternatives_summary(alternatives: list[dict]) -> str:
-    """Render alternatives as a standalone markdown summary for rounds/iter_NNN/."""
-    if not alternatives:
-        return "_No alternatives produced this round._\n"
-    lines: list[str] = [f"# Reframer alternatives ({len(alternatives)})"]
+    lines.append(f"# Reframer alternatives ({len(alternatives)})")
     for a in alternatives:
         lines.append("")
         lines.append(f"## `{a['id']}` — {a.get('cognitive_move', '?')}")
@@ -182,6 +257,18 @@ def format_alternatives_summary(alternatives: list[dict]) -> str:
                 f"`{a['invalid_cognitive_move_raw']}` — normalized to "
                 f"`{a['cognitive_move']}`)_"
             )
+        ca = a.get("constraint_accounting") or []
+        if ca:
+            lines.append("")
+            lines.append("### Constraint accounting")
+            lines.append("")
+            for c in ca:
+                lines.append(
+                    f"- **[{c.get('treatment', '?')}]** "
+                    f"{c.get('constraint', '?')}"
+                )
+                if c.get("how"):
+                    lines.append(f"    - {c['how']}")
         if a.get("sketch"):
             lines.append("")
             lines.append("### Sketch")

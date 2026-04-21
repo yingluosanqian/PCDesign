@@ -273,7 +273,6 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"  reframer_model:   {meta.reframer_model}")
     print(f"  reframe_at_round: {meta.reframe_at_round}")
     print(f"  reframe_tested:   {meta.reframe_tested}")
-    print(f"  reframe_pending:  {meta.reframe_pending}")
     print(f"  iterations_done:  {meta.iterations_done}")
     print(f"  converged:        {meta.converged}")
     if meta.convergence_note:

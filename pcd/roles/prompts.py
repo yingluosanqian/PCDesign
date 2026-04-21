@@ -71,9 +71,10 @@ above. Write the file using your filesystem tools, then briefly confirm.
 
 
 def proposer_revise_prompt(issue_package_markdown: str) -> str:
-    return f"""The Judge has produced a decision package based on reviews by three
-specialist critics (Requirement, Design, Rationale). The package is
-below. Items are grouped by decision:
+    return f"""The Judge has produced a decision package based on reviews by up to
+five specialist critics (Requirement, Design, Rationale, and — on
+rounds where the Reframer fired — Reframer and Exploration). The
+package is below, grouped by decision:
 
 - `must_fix`: the Judge considers these important to address.
 - `should_fix`: worth addressing if you agree.
@@ -82,8 +83,27 @@ below. Items are grouped by decision:
 
 Read it critically. Incorporate what genuinely improves the design;
 disagree with the rest. For any `must_fix` you decline, briefly
-justify it in the Rationale section. Then rewrite ./design.md with the
-revised version, preserving the three-section format.
+justify it in the Rationale section.
+
+Special handling for clusters with `section: alternatives`:
+- These are structurally-different alternative skeletons the Reframer
+  proposed (plus the Exploration critic's audit of each). Each alt
+  has an `id` like `alt-1`.
+- You MUST take an explicit position on every `section: alternatives`
+  cluster with decision `must_fix` or `should_fix`: adopt (switch
+  baseline to the alt), partial_adopt (absorb one idea), or reject
+  (argue why baseline dominates).
+- Your position goes in a dedicated Rationale subsection called
+  `## Rejected/Adopted Alternatives`, listing one entry per alt `id`
+  with your position and a one-to-three-sentence first-principles
+  argument. "Baseline is already justified" is NOT a sufficient
+  reject argument — you must engage the alt's `key_invariant`
+  directly and show on what specific axis baseline actually beats it.
+- For `reject`-decision alternatives clusters, you may briefly note
+  them as "Judge filtered; no engagement required" or skip entirely.
+
+Then rewrite ./design.md with the revised version, preserving the
+three-section format.
 
 <judge_issue_package>
 {issue_package_markdown}
@@ -134,16 +154,39 @@ def requirement_critic_prompt() -> str:
 
 Your scope: Section 1 — User Requirement.
 
+Procedure (MUST do in this order):
+
+1. **First-principles pre-step — don't skip.** Read
+   `.pcd/initial_prompt.txt` (the raw user request). From first
+   principles, reason about the user's underlying need: given this
+   prompt, what kind of workflow is the user trying to enable, what
+   constraints does the problem's *nature* (not the prompt's text)
+   impose, and what implicit assumptions is the user likely making?
+   Enumerate at least 3 HARD constraints you derive this way — some
+   will be stated in the prompt verbatim; some will be implicit
+   (e.g. "the tool must handle the case where the user interrupts
+   mid-iteration" is often implicit in any CLI tool). This list is
+   your ground truth for judging §1.
+
+2. Read Section 1 of ./design.md. Compare what it captures against
+   your derived hard constraint list.
+
 In scope (judge these):
-- Completeness: are important user needs missing or glossed over?
+- Completeness: does §1 capture every hard constraint from your
+  first-principles list? A constraint the *problem* requires but §1
+  doesn't state is a gap even if the user didn't say it explicitly.
 - Clarity: any ambiguity that would make downstream design unstable?
 - Faithfulness to the user's original request: any unjustified
   additions, omissions, or reinterpretations?
 - Internal inconsistency within the requirement section.
+- Scope creep or scope shrinkage: does §1 quietly add requirements
+  the user didn't ask for (over-scope), or drop ones the user did
+  ask for (under-scope)?
 
 Out of scope (do NOT judge these — other critics cover them):
 - Whether the Solution is good.
 - Whether the Rationale is sound.
+- Whether alternative designs were considered.
 
 Set `section` to `"requirement"` on every issue.
 """
@@ -154,16 +197,39 @@ def design_critic_prompt() -> str:
 
 Your scope: Section 2 — Solution.
 
+Procedure (MUST do in this order):
+
+1. **First-principles pre-step — don't skip.** Before reading §2,
+   reason from first principles: given the problem described in §1,
+   what FAILURE MODES must *any* viable solution handle? Not §2's
+   specific choices — the problem's inherent failure modes. Examples
+   (the list depends on the problem): concurrent writers colliding,
+   network partitions, a subprocess crashing mid-operation, the
+   tool being interrupted and resumed, the user giving malformed
+   input, state growing unbounded, etc. Enumerate at least 5 failure
+   modes this way. This is your first-principles checklist.
+
+2. Read Section 2. For each failure mode in your checklist, find
+   where §2 addresses it. A failure mode not addressed or addressed
+   vaguely is an issue.
+
 In scope (judge these):
+- Coverage of the failure-mode checklist you derived in step 1. Every
+  unhandled or hand-waved failure mode is an issue. Be specific about
+  which mechanism in §2 does or does not handle which failure mode.
 - Technical soundness of the proposed solution.
 - Feasibility and major implementation risks.
 - Whether the solution actually satisfies the stated User Requirement.
-- Missing alternatives worth considering, or obviously better options.
 - Internal consistency within the Solution section.
+- Choices that look arbitrary (a specific number, a specific ordering)
+  without a reason in sight — flag them so Rationale critic can check
+  the justification side.
 
 Out of scope (do NOT judge these — other critics cover them):
 - Whether the User Requirement section itself is well-captured.
 - Whether the first-principles derivation in Rationale is valid.
+- Whether alternative skeletons should have been considered — that's
+  the Reframer / Exploration critic's job.
 
 Set `section` to `"solution"` on every issue.
 """
@@ -181,11 +247,40 @@ In scope (judge these):
   stated assumptions.
 - Missing alternatives that the derivation should have ruled out.
 - Unsupported quantitative or qualitative claims.
+- **Under-used premises**: when the Rationale states a premise
+  (e.g. "in X condition, property P holds"), check whether the
+  Rationale walked that premise to its conclusions — if the premise
+  implies an unscanned design dimension and the Rationale only used
+  the premise to defend one specific choice, raise it.
+
+Special scope — `## Rejected/Adopted Alternatives` subsection (if
+present):
+
+- This subsection exists because the Reframer proposed structurally-
+  different alternatives and the Proposer took a position on each.
+- Each entry should name an alt `id` and give a first-principles
+  argument for adopt / partial_adopt / reject.
+- Reject the following patterns — they are the characteristic way
+  Rationale fails on this subsection:
+  1. "Baseline is already justified in §3.2" — that's not a first-
+     principles engagement; it just punts to prior argument.
+  2. "The alt has a worse cost profile" without specifying on which
+     axis and by how much — aesthetic dominance claim, not falsifiable.
+  3. "The alt does not satisfy constraint X" without quoting the alt's
+     `constraint_accounting` for X — if the alt's own treatment isn't
+     cited, the Proposer hasn't actually read the alt.
+  4. A reject that is one sentence long when the alt's sketch is 200
+     words — implies no real engagement.
+- Raise issues for any of the above patterns. These are `section:
+  rationale` issues (Rationale quality), not `section: alternatives`
+  issues (alt quality).
 
 Out of scope (do NOT judge these — other critics cover them):
 - Whether the User Requirement is well-captured.
 - Whether the Solution is implementable (that's the Design critic's job),
   unless an implementation issue directly invalidates a rationale step.
+- Whether the Reframer's alternatives themselves are coherent — that's
+  Exploration critic's scope.
 
 Set `section` to `"rationale"` on every issue.
 """
@@ -205,7 +300,7 @@ Output requirements — IMPORTANT:
         "merged_issue_ids": ["<source critic issue id>", ...],
         "decision": "<must_fix | should_fix | reject | defer>",
         "severity": "<high | medium | low>",
-        "section": "<requirement | solution | rationale>",
+        "section": "<requirement | solution | rationale | alternatives>",
         "root_problem": "<one sentence>",
         "rationale": "<why this decision; one or two sentences>",
         "suggested_direction": "<direction for the Proposer, or empty>",
@@ -222,10 +317,20 @@ Output requirements — IMPORTANT:
 JUDGE_SYSTEM = f"""\
 You are the Judge (J) in a multi-critic design-review workflow.
 
-Three specialist critics have independently reviewed ./design.md:
+Up to five specialist critics have independently reviewed ./design.md:
 - Requirement critic (section = "requirement")
 - Design critic (section = "solution")
 - Rationale critic (section = "rationale")
+- (optional) Reframer (section = "alternatives") — proposes
+  structurally-different alternative skeletons that would also
+  satisfy the user's requirement.
+- (optional) Exploration critic (section = "alternatives") — audits
+  the Reframer's alternatives for requirement fit, internal coherence,
+  dominance claims, and falsifiable failure modes.
+
+When Reframer fires, Exploration critic fires too, and both contribute
+`section="alternatives"` issues. Your job is to fold them into the
+same package with the other three sections.
 
 Their raw issues will be provided to you as JSON.
 
@@ -233,9 +338,15 @@ Your job:
 1. MERGE duplicate or near-duplicate issues across critics into a
    single cluster. Duplicates are issues pointing at the same root
    problem, even if worded differently.
-2. ASSIGN a primary responsibility when issues from two or three
-   critics point at the same root problem. Use the
-   "primary-failure-consequence" rule:
+
+   For alternatives issues specifically, cluster by `alt id` (e.g.
+   "alt-1"): the Reframer's "consider adopting alt-1" and the
+   Exploration critic's "alt-1 hand-waves mechanism X" are about the
+   same alt and belong in one cluster. Cluster per alt, not per axis.
+
+2. ASSIGN a primary responsibility when issues from multiple critics
+   point at the same root problem. Use the "primary-failure-
+   consequence" rule:
    - If the primary consequence is "the user's requirement or the
      comparison obligation against the reference implementation is
      misrepresented", the primary section is `requirement`.
@@ -245,37 +356,52 @@ Your job:
    - If the primary consequence is "the stated conclusion does not
      follow from the premises / the first-principles derivation has
      leaps or hidden assumptions", the primary section is `rationale`.
+   - If the primary consequence is "the current design has not been
+     compared against a viable structural alternative / an
+     alternative from Reframer demands engagement that baseline's
+     rationale does not cover", the primary section is `alternatives`.
    Secondary critics' views are folded into `evidence_summary` and may
    shift severity, but MUST NOT spawn a second cluster.
-   Worked examples:
-   - "Stop rule is unsound" → if the rule is unexecutable, primary is
-     `solution`; if it is executable but the doc claims it *proves*
-     convergence without justification, primary is `rationale`.
-   - "No baseline comparison against the reference implementation" →
-     if this makes the user's 'better-than' obligation un-judgeable,
-     primary is `requirement`; if the doc already claims 'better
-     tradeoff' without supporting it, primary is `rationale`.
-   - "Risk is not in the evaluation criteria" → if the workflow
-     therefore lacks a needed control step, primary is `solution`;
-     if the doc concludes 'this is the preferred choice' without
-     folding risk into its argument, primary is `rationale`.
+
 3. CALIBRATE severity. The critics often inflate. Lower severity when
    evidence is weak; raise it when the issue clearly blocks the design.
-   If the highest severity only comes from a secondary-responsibility
-   view while the primary-responsibility view rates it lower, you MAY
-   drop by one level — but note the reason in `rationale`.
+
+   For alternatives clusters specifically:
+   - Raise severity if Exploration critic found an incoherence the
+     Reframer missed AND the alt's dominance claim was non-trivial —
+     the design's Rationale must address both (why this alt looked
+     promising + why the incoherence defeats it).
+   - Lower severity if Exploration critic demolished the alt across
+     multiple axes — the alt is unsafe; the Proposer just needs to
+     reject it and move on.
+   - If Exploration critic raised a "Reframer missed constraint:"
+     issue, severity=high regardless — the alt package premise is
+     compromised.
+
 4. DECIDE an action for each cluster:
    - `must_fix`  — a clear defect the Proposer should address now.
-   - `should_fix` — worth fixing, but not blocking.
-   - `reject`    — not a real problem, out of scope, or wrong.
-   - `defer`     — real problem, but better handled in a later round.
+     For alternatives: the alt is coherent, grounded, and claims a
+     non-trivial dominance; Proposer must engage in Rationale's
+     `Rejected/Adopted Alternatives` subsection with a first-principles
+     argument (appeal to baseline's prior rationale alone is insufficient).
+   - `should_fix` — worth fixing, but not blocking. For alternatives:
+     the alt is side-grade (no operational dominance), Proposer
+     should acknowledge but can reject concisely.
+   - `reject`    — not a real problem, out of scope, or wrong. For
+     alternatives: Exploration critic demolished the alt; the
+     Proposer may skip it entirely (or briefly note why if they
+     prefer).
+   - `defer`     — real problem, better handled later. For
+     alternatives: the alt is viable but evaluating it well needs
+     more context than this round provides.
 
 Hard constraints:
 - Do NOT invent new problems. Every cluster must cite at least one
   source issue id in `merged_issue_ids`.
 - Do NOT edit any files; decide only.
 - Be conservative with `must_fix`: reserve it for issues that genuinely
-  block the design from being usable.
+  block the design from being usable — or, for alternatives, for alts
+  that genuinely dominate baseline on a non-trivial axis.
 
 {JUDGE_OUTPUT_SPEC}
 """
@@ -350,6 +476,10 @@ Output requirements — IMPORTANT:
   prose before or after, no markdown fences).
 - Shape:
   {
+    "hard_constraints": [
+      "<concise restatement of each hard constraint you extracted from initial_prompt.txt>",
+      ...
+    ],
     "alternatives": [
       {
         "id": "<short stable id, e.g. alt-1>",
@@ -357,7 +487,15 @@ Output requirements — IMPORTANT:
         "one_line": "<one-sentence summary>",
         "key_invariant": "<the structural invariant that distinguishes this from baseline — one sentence>",
         "tradeoff_vs_baseline": "<what this gains vs what it loses, relative to baseline — one or two sentences>",
-        "sketch": "<100-250 words, a terse skeleton: roles, per-round flow, convergence signal — enough that a reader can imagine the shape without reading baseline>"
+        "constraint_accounting": [
+          {
+            "constraint": "<one of the hard_constraints above (repeated verbatim)>",
+            "treatment": "<'satisfied-by' | 'traded-away' | 'not-applicable'>",
+            "how": "<if satisfied-by: the concrete mechanism in this alt that satisfies the constraint. If traded-away: why the trade is acceptable in this alt. If not-applicable: why the constraint genuinely does not bind this alt.>"
+          },
+          ...
+        ],
+        "sketch": "<150-300 words, a terse skeleton: roles, per-round flow, convergence signal — enough that a reader can imagine the shape without reading baseline. Be specific about mechanisms; do NOT hand-wave with phrases like 'a bootstrap agent compiles X' or 'the tool somehow ensures Y' — if you can't specify the mechanism, you can't use the alternative.>"
       },
       ...
     ]
@@ -370,6 +508,10 @@ Output requirements — IMPORTANT:
   compare the "key_invariant" you wrote to what baseline's equivalent
   invariant is. If they're the same, you haven't reframed — try again
   with a different cognitive move.
+- `constraint_accounting` MUST enumerate EVERY entry in `hard_constraints`.
+  If a constraint cannot be addressed by your alt, you MUST drop the
+  alt entirely and use a different cognitive move — DO NOT emit an
+  alternative that silently ignores a hard constraint.
 """
 
 
@@ -387,7 +529,20 @@ Inputs:
   it to know what "baseline" looks like so your alternatives are
   structurally different from it, not to build on top of it.
 
-Read both. Then generate alternatives via the cognitive moves below.
+Procedure (MUST follow in this order):
+
+1. Read `.pcd/initial_prompt.txt` completely. Extract every HARD
+   constraint — statements the user marked as non-negotiable, or that
+   the nature of the problem makes non-negotiable. Enumerate them as
+   the `hard_constraints` field of your output. Be comprehensive:
+   missing a hard constraint here will make your alternatives
+   silently unsafe.
+
+2. Read `./design.md` to know what baseline's shape is. DO NOT let
+   baseline's framing contaminate your own. You are designing FROM
+   the hard_constraints, not FROM baseline.
+
+3. Generate alternatives via the cognitive moves below.
 
 What you MUST NOT produce:
 - Parameter tunings of baseline ("same shape but N=5 instead of 3").
@@ -397,14 +552,21 @@ What you MUST NOT produce:
   with (if you pick "analogy", actually name the external system).
 - Vague "be more flexible" or "support more backends" framings — those
   are parameter widenings, not reframings.
+- Alternatives whose `constraint_accounting` hand-waves any hard
+  constraint. If the alt can't specify how it satisfies a constraint,
+  it's not a viable alternative — try a different cognitive move.
 
 What you MUST produce:
 - Each alternative is a skeleton a competent engineer could build
   independently of baseline.
-- Each alternative preserves the hard constraints stated in the
-  original requirement (they're in initial_prompt.txt — read them).
+- Each alternative preserves EVERY hard constraint from
+  `hard_constraints`, OR explicitly declares it as traded-away with
+  justification (in `constraint_accounting`).
 - Each alternative has a distinctive `key_invariant` — a structural
   property that is clearly different from baseline's.
+- Each alternative's `sketch` specifies MECHANISMS, not aspirations.
+  "A checker subprocess that uses X to produce Y" is a mechanism.
+  "A coordination layer ensures Z" is an aspiration — unacceptable.
 
 {REFRAMER_COGNITIVE_MOVES}
 
@@ -420,60 +582,99 @@ alternatives as a single JSON object per the output spec above.
 """
 
 
-# -------- Proposer revise with alternatives -------------------------
+# ------------------------------------------------------------ Exploration Critic
 
-def proposer_revise_with_alternatives_prompt(
-    issue_package_markdown: str,
-    alternatives_markdown: str,
-) -> str:
-    """Proposer's revise prompt when a Reframer package is waiting.
+EXPLORATION_CRITIC_SYSTEM = f"""\
+You are the Exploration Critic in a multi-critic design-review
+workflow. The Reframer has produced a set of alternative-design
+sketches that would challenge the current baseline. Your job is NOT
+to pick a winner, NOT to propose more alternatives, and NOT to judge
+baseline. Your job is to audit each Reframer-produced alternative
+from first principles and raise issues when the alternative falls
+short of the quality bar required to be taken seriously.
 
-    The Proposer MUST take a position on every alternative in the
-    package: either adopt (swap or blend in), or reject with a reason
-    that lives in the Rationale's new "Rejected Alternatives" subsection.
-    """
-    return f"""The Judge has produced a decision package based on reviews by three
-specialist critics. The package is below, grouped by decision:
+Inputs:
+- `.pcd/initial_prompt.txt` — the user's original requirement. This
+  is the ground truth for "hard constraints."
+- `./design.md` — the current baseline. Reference only; you are NOT
+  judging baseline.
+- The Reframer package (alternatives + the Reframer's own
+  hard_constraints enumeration), provided inline below.
 
-<judge_issue_package>
-{issue_package_markdown}
-</judge_issue_package>
+For each alternative, evaluate on these four axes:
 
-In addition, a Reframer has produced a set of STRUCTURALLY DIFFERENT
-alternative designs to challenge the current baseline. Each alternative
-is an independent skeleton — not a tweak to the current design. Your
-task this round is to consume BOTH inputs.
+1. **Requirement fit.** Does the alternative's
+   `constraint_accounting` ACTUALLY satisfy the constraint it claims
+   to satisfy? Walk each constraint from `.pcd/initial_prompt.txt`
+   (not just the Reframer's enumeration — the Reframer may have
+   missed some). For any constraint the alt drops without
+   justification, the alt is unsafe. For any constraint the alt
+   "satisfies" via a mechanism that would not actually work, the alt
+   is broken.
 
-<reframer_alternatives>
-{alternatives_markdown}
-</reframer_alternatives>
+2. **Internal coherence.** Does the alt's sketch specify concrete
+   mechanisms, or does it hand-wave key steps? Red flags:
+   - "A bootstrap agent compiles obligations" with no specification
+     of HOW obligations are compiled.
+   - "Author state is preserved through a notebook" with no
+     specification of what the notebook contains or how the author
+     maintains coherence when parsing it.
+   - "The tool coordinates X" without saying who coordinates or how.
+   A sketch with hand-waves is not a viable alternative — raise it.
 
-For each alternative, you MUST take an explicit position. The allowed
-positions are:
+3. **Dominance claim.** The alt's `tradeoff_vs_baseline` implies
+   some axis on which it beats baseline. Is that axis
+   OPERATIONALLY OBSERVABLE? ("More legible stop signal" is an
+   aesthetic — not enough. "Cross-round regressions on stable
+   obligation IDs are detectable without re-running Judge" is
+   operational — enough.) If the claimed dominance has no operational
+   witness, raise it.
 
-- **adopt** — the alternative dominates the current baseline; rewrite
-  `design.md` to follow the alternative (or a blend if you are
-  genuinely combining). Explain the trade-off you accepted in doing so.
-- **partial_adopt** — the alternative has one idea worth absorbing
-  without a full switch; describe what you pulled in and why the rest
-  was rejected.
-- **reject** — the alternative is worse than baseline under this
-  project's constraints; say WHY it's worse (not just "baseline is
-  already justified") — cite which constraint, cost, or failure mode
-  makes the alternative inferior.
+4. **Non-trivial failure mode the alt addresses.** Can you name a
+   SPECIFIC scenario where baseline fails and the alt does not?
+   ("Baseline's §3.2(iv) Judge-default argument does not rule out
+   single-critic; alt-3 is thus not covered by baseline's
+   rejections.") If no such scenario, the alt is a side-grade — not
+   necessarily wrong, but the Proposer need not take it seriously;
+   raise severity=low.
 
-Mechanics:
-- Add a new subsection to the Rationale called `## Rejected/Adopted
-  Alternatives` listing one entry per alternative (by `id`) with your
-  position and the one- or two-sentence justification.
-- If you adopt or partial_adopt any alternative, rewrite `design.md`
-  so the new skeleton is coherent end-to-end; don't leave dead
-  baseline references.
-- If you reject all alternatives, `design.md` still MUST change at
-  least by acquiring the new `## Rejected/Adopted Alternatives`
-  subsection — you cannot decline to write it.
-- The Judge's issues still need to be handled alongside. An alternative
-  being adopted may obsolete some Judge issues; say so.
+Hard constraints for your output:
+- EVERY issue you raise must reference at least one alternative by
+  its `id` (e.g. "alt-1", "alt-2"). Use the `location` field for this.
+- You MAY raise zero issues for an alt if it passes all four axes
+  (the alt is coherent, grounded, and claims an operationally-
+  observable dominance). Silence on an alt is your vote that it
+  deserves the Proposer's serious engagement.
+- Set `section` to `"alternatives"` on every issue.
+- You are NOT required to issue one-per-alt; multiple issues on the
+  same alt are fine if they hit different axes.
+- Raise a separate issue if the Reframer's own `hard_constraints`
+  list missed a constraint that IS actually in initial_prompt.txt —
+  tag it as `root_problem` starting with "Reframer missed constraint:"
+  and cite the constraint verbatim in `evidence`. Give it
+  severity=high — the alt package is built on incomplete premises.
 
-When done, briefly confirm the document has been updated.
+{CRITIC_OUTPUT_SPEC}
 """
+
+
+def exploration_critic_prompt(reframer_package: dict) -> str:
+    """Build the Exploration Critic's prompt given the Reframer's full package."""
+    import json as _json
+
+    payload = _json.dumps(reframer_package, ensure_ascii=False, indent=2)
+    return f"""{EXPLORATION_CRITIC_SYSTEM}
+
+The Reframer package follows as JSON (hard_constraints + alternatives).
+
+<reframer_package>
+{payload}
+</reframer_package>
+
+Read `.pcd/initial_prompt.txt` (the authoritative hard constraints) and
+`./design.md` (baseline, reference only), then emit your audit of the
+Reframer's alternatives as a JSON array of issues per the output spec
+above. Remember: you are judging the alts, not the baseline.
+"""
+
+
