@@ -160,8 +160,8 @@ def is_converged(judgment: dict) -> bool:
     """Single-round quality-suppression check: no must_fix, ≤2 should_fix, no actionable high.
 
     NOTE: this is one of the two signals the orchestrator requires for
-    declaring overall convergence. The other is `is_stable` (must_fix
-    did not rebound vs the previous round). Callers that want the
+    declaring overall convergence. The other is `is_stable` (the
+    previous round was itself quality_ok). Callers that want the
     combined signal should `and` both together.
     """
     s = judgment.get("summary") or {}
@@ -172,29 +172,26 @@ def is_converged(judgment: dict) -> bool:
     )
 
 
-def must_fix_count(judgment: dict | None) -> int | None:
-    """Return the must_fix count for a judgment, or None if not extractable."""
-    if not isinstance(judgment, dict):
-        return None
-    s = judgment.get("summary") or {}
-    v = s.get("must_fix_count")
-    return v if isinstance(v, int) else None
+def is_stable(prev_judgment: dict | None) -> bool:
+    """Stability: the most-recent non-degraded round was itself quality_ok.
 
+    Combined with `is_converged(curr)` the convergence rule becomes "two
+    consecutive quality_ok rounds" — the second observation supplies the
+    cross-round evidence §1.3 of the design requires.
 
-def is_stable(
-    prev_judgment: dict | None, curr_judgment: dict
-) -> bool:
-    """Stability signal: must_fix count did not rebound from prev to current.
+    The previous form (`prev.must_fix >= curr.must_fix`) was trivially
+    true whenever `is_converged(curr)` already forced `curr.must_fix == 0`,
+    so stability carried no real signal and a single 5→0 transition
+    declared convergence. Requiring the prev round to be quality_ok is
+    the §3.4 C4 fix from the iterated spec.
 
-    A stable round requires a prior round to compare against, and the
-    current round's must_fix count must be <= the previous round's
-    (no rebound). First rounds are never stable.
+    Callers are responsible for passing the last NON-DEGRADED judgment as
+    `prev_judgment` — a Proposer no-op or critic failure must not count
+    as evidence the design is stable.
     """
-    prev_mf = must_fix_count(prev_judgment)
-    curr_mf = must_fix_count(curr_judgment)
-    if prev_mf is None or curr_mf is None:
+    if not isinstance(prev_judgment, dict):
         return False
-    return prev_mf >= curr_mf
+    return is_converged(prev_judgment)
 
 
 def no_progress(must_fix_history: list[int]) -> bool:
@@ -215,11 +212,21 @@ def format_round_summary(
     critics_output: dict,
     judgment: dict,
     manually_edited: bool = False,
+    degraded: bool = False,
+    degraded_reasons: list[str] | None = None,
 ) -> str:
     """Render one iteration — all three critics + the Judge's package — as
     a single human-readable markdown document. Dropped onto disk at
     `.pcd/rounds/iter_NNN/summary.md` next to the per-role JSON files."""
     lines: list[str] = [f"# Iteration {iteration}"]
+    if degraded:
+        reasons = ", ".join(degraded_reasons or []) or "unspecified"
+        lines.append("")
+        lines.append(
+            f"> ⚠ **Degraded round**: {reasons}. This round's quality signal "
+            "is not counted as stability evidence for later rounds, and is "
+            "skipped from the no-progress sliding window."
+        )
     if manually_edited:
         lines.append("")
         lines.append(

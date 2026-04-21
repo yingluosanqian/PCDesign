@@ -6,6 +6,7 @@ from typing import Callable, Optional
 
 from pcd.agents import make_agent_client
 from pcd.issues import parse_critic_issues
+from pcd.roles._guard import readonly_guarded
 from pcd.roles.prompts import (
     design_critic_prompt,
     rationale_critic_prompt,
@@ -38,25 +39,35 @@ def run_critic(
     reasoning_effort: str = "medium",
     agent: str = "codex",
     on_progress: Optional[Callable[[str], None]] = None,
-) -> list[dict]:
-    """Run one fresh critic session for the given role; return parsed issues."""
+) -> tuple[list[dict], bool]:
+    """Run one fresh critic session for the given role.
+
+    Returns `(issues, contaminated)`. `contaminated` is True if the
+    critic subprocess modified design.md (claude has no read-only
+    sandbox, so this is the structural enforcement); in that case the
+    file has been restored from a pre-call snapshot.
+    """
     if role not in _PROMPT_BY_ROLE:
         raise ValueError(f"unknown critic role: {role!r}")
-    with make_agent_client(
-        agent,
-        cwd=str(project_root),
-        reasoning_effort=reasoning_effort,
-    ) as client:
-        thread_id = client.start_thread(
+
+    def _body():
+        with make_agent_client(
+            agent,
             cwd=str(project_root),
-            model=model,
-            sandbox="read-only",
-        )
-        result = client.run_turn(
-            thread_id=thread_id,
-            cwd=str(project_root),
-            model=model,
-            prompt=_PROMPT_BY_ROLE[role](),
-            on_progress=on_progress,
-        )
-    return parse_critic_issues(role, result.final_text)
+            reasoning_effort=reasoning_effort,
+        ) as client:
+            thread_id = client.start_thread(
+                cwd=str(project_root),
+                model=model,
+                sandbox="read-only",
+            )
+            return client.run_turn(
+                thread_id=thread_id,
+                cwd=str(project_root),
+                model=model,
+                prompt=_PROMPT_BY_ROLE[role](),
+                on_progress=on_progress,
+            )
+
+    result, contaminated = readonly_guarded(project_root, _body)
+    return parse_critic_issues(role, result.final_text), contaminated

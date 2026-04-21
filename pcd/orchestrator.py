@@ -44,7 +44,9 @@ def run_single_iteration(
     meta = project.load_meta()
     iteration = meta.iterations_done + 1
 
-    prev_record = project.last_judgment()
+    # Stability always looks back to the last NON-degraded round — a
+    # Proposer no-op or critic failure must not supply stability evidence.
+    prev_record = project.last_non_degraded_judgment()
     prev_judgment = (prev_record or {}).get("judgment") if prev_record else None
 
     print(
@@ -53,6 +55,8 @@ def run_single_iteration(
         flush=True,
     )
     critics_output: dict[str, list[dict]] = {}
+    critic_failures: list[str] = []
+    contaminated_critics: list[str] = []
     with ThreadPoolExecutor(max_workers=len(CRITIC_ROLES)) as pool:
         futures = {
             pool.submit(
@@ -71,7 +75,16 @@ def run_single_iteration(
         for future in futures:
             role = futures[future]
             try:
-                critics_output[role] = future.result()
+                issues, contaminated = future.result()
+                critics_output[role] = issues
+                if contaminated:
+                    contaminated_critics.append(role)
+                    print(
+                        f"[pcd] iter {iteration}: critic {role!r} wrote "
+                        f"design.md; rolled back from snapshot",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             except Exception as e:
                 print(
                     f"[pcd] iter {iteration}: critic {role!r} failed: {e}",
@@ -79,6 +92,7 @@ def run_single_iteration(
                     flush=True,
                 )
                 critics_output[role] = []
+                critic_failures.append(role)
 
     total_issues = sum(len(v) for v in critics_output.values())
     print(
@@ -86,7 +100,7 @@ def run_single_iteration(
         file=sys.stderr,
         flush=True,
     )
-    judgment = run_judge(
+    judgment, judge_contaminated = run_judge(
         project_root=project.root,
         critics_output=critics_output,
         model=judge_model,
@@ -94,6 +108,13 @@ def run_single_iteration(
         agent=judge_agent,
         on_progress=_make_role_progress(f"iter {iteration} judge"),
     )
+    if judge_contaminated:
+        print(
+            f"[pcd] iter {iteration}: judge wrote design.md; rolled back "
+            f"from snapshot",
+            file=sys.stderr,
+            flush=True,
+        )
 
     manually_edited = False
     if manual_judge:
@@ -102,17 +123,99 @@ def run_single_iteration(
             judgment = edited
             manually_edited = True
 
+    summary = judgment.get("summary") or {}
+    quality_ok = is_converged(judgment)
+    stable = is_stable(prev_judgment)
+    degraded_reasons: list[str] = []
+    if critic_failures:
+        degraded_reasons.append(
+            f"critics failed: {', '.join(critic_failures)}"
+        )
+    if contaminated_critics:
+        degraded_reasons.append(
+            "critics modified design.md (rolled back): "
+            + ", ".join(contaminated_critics)
+        )
+    if judge_contaminated:
+        degraded_reasons.append("judge modified design.md (rolled back)")
+    degraded = bool(degraded_reasons)
+    # A degraded round can never declare convergence — its quality_ok may
+    # be an artifact of missing input, not real quality.
+    converged = quality_ok and stable and not degraded
+    print(
+        f"[pcd] iter {iteration}: summary {summary}; "
+        f"quality_ok={quality_ok} stable={stable} "
+        f"degraded={degraded} converged={converged}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    revise_note = ""
+    if degraded:
+        revise_note = (
+            "degraded — no revise (" + "; ".join(degraded_reasons) + ")"
+        )
+    elif converged:
+        revise_note = "converged — no revise"
+    elif quality_ok and not stable:
+        # Clean round but no stability evidence yet — skip revise; next
+        # round will supply the comparison. Avoids wasting a P call on
+        # an empty package.
+        revise_note = "quality ok, awaiting stability — no revise"
+    else:
+        print(
+            f"[pcd] iter {iteration}: proposer revising with judge package",
+            file=sys.stderr,
+            flush=True,
+        )
+        issue_package_md = format_issue_package_for_proposer(judgment)
+        before_hash = project.design_hash()
+        run_proposer_revise(
+            project_root=project.root,
+            thread_id=meta.p_thread_id,
+            issue_package_markdown=issue_package_md,
+            model=proposer_model,
+            reasoning_effort=proposer_reasoning,
+            agent=proposer_agent,
+            on_progress=_make_role_progress(f"iter {iteration} proposer"),
+        )
+        after_hash = project.design_hash()
+        if (
+            before_hash is not None
+            and after_hash is not None
+            and before_hash == after_hash
+        ):
+            degraded = True
+            degraded_reasons.append("proposer no-op (design.md unchanged)")
+            revise_note = "proposer no-op — degraded"
+            print(
+                f"[pcd] iter {iteration}: proposer produced no change to "
+                f"design.md; marking round degraded",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            revise_note = "revised"
+
+    convergence_note = _describe_convergence(
+        summary, quality_ok, stable, degraded, degraded_reasons
+    )
+
     project.append_judgment(
         iteration=iteration,
         judgment=judgment,
         critics_output=critics_output,
         manually_edited=manually_edited,
+        degraded=degraded,
+        degraded_reasons=degraded_reasons,
     )
     round_dir = project.dump_round(
         iteration=iteration,
         critics_output=critics_output,
         judgment=judgment,
         manually_edited=manually_edited,
+        degraded=degraded,
+        degraded_reasons=degraded_reasons,
     )
     print(
         f"[pcd] iter {iteration}: round artifacts at {round_dir}",
@@ -120,60 +223,11 @@ def run_single_iteration(
         flush=True,
     )
 
-    summary = judgment.get("summary") or {}
-    quality_ok = is_converged(judgment)
-    stable = is_stable(prev_judgment, judgment)
-    converged = quality_ok and stable
-    convergence_note = _describe_convergence(summary, quality_ok, stable)
-    print(
-        f"[pcd] iter {iteration}: summary {summary}; "
-        f"quality_ok={quality_ok} stable={stable} converged={converged}",
-        file=sys.stderr,
-        flush=True,
-    )
-
-    if converged:
-        meta.iterations_done = iteration
-        meta.converged = True
-        meta.convergence_note = convergence_note
-        project.save_meta(meta)
-        project.append_revision(iteration=iteration, note="converged — no revise")
-        return judgment
-
-    if quality_ok and not stable:
-        # Clean round but no stability evidence yet — skip revise; next
-        # round will supply the comparison. Avoids wasting a P call on
-        # an empty package.
-        meta.iterations_done = iteration
-        meta.converged = False
-        meta.convergence_note = convergence_note
-        project.save_meta(meta)
-        project.append_revision(
-            iteration=iteration,
-            note="quality ok, awaiting stability — no revise",
-        )
-        return judgment
-
-    print(
-        f"[pcd] iter {iteration}: proposer revising with judge package",
-        file=sys.stderr,
-        flush=True,
-    )
-    issue_package_md = format_issue_package_for_proposer(judgment)
-    run_proposer_revise(
-        project_root=project.root,
-        thread_id=meta.p_thread_id,
-        issue_package_markdown=issue_package_md,
-        model=proposer_model,
-        reasoning_effort=proposer_reasoning,
-        agent=proposer_agent,
-        on_progress=_make_role_progress(f"iter {iteration} proposer"),
-    )
     meta.iterations_done = iteration
-    meta.converged = False
+    meta.converged = converged
     meta.convergence_note = convergence_note
     project.save_meta(meta)
-    project.append_revision(iteration=iteration, note="revised")
+    project.append_revision(iteration=iteration, note=revise_note)
     return judgment
 
 
@@ -245,12 +299,21 @@ def _make_role_progress(role_label: str) -> Callable[[str], None]:
     return progress
 
 
-def _describe_convergence(summary: dict, quality_ok: bool, stable: bool) -> str:
+def _describe_convergence(
+    summary: dict,
+    quality_ok: bool,
+    stable: bool,
+    degraded: bool,
+    degraded_reasons: list[str],
+) -> str:
     base = (
         f"must_fix={summary.get('must_fix_count', 0)}, "
         f"should_fix={summary.get('should_fix_count', 0)}, "
         f"high_severity={summary.get('high_severity_count', 0)}"
     )
+    if degraded:
+        reasons = "; ".join(degraded_reasons) or "unspecified"
+        return f"degraded: {reasons}; {base}"
     if quality_ok and stable:
         return f"converged: {base}"
     if quality_ok and not stable:

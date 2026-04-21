@@ -266,9 +266,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
             f"defer={s.get('defer_count', 0)}, "
             f"high_severity={s.get('high_severity_count', 0)}"
         )
+        if last.get("degraded"):
+            reasons = "; ".join(last.get("degraded_reasons") or []) or "unspecified"
+            print(f"  last_degraded:    yes ({reasons})")
     mf_history = project.must_fix_history()
     if mf_history:
-        print(f"  must_fix_trend:   {mf_history}")
+        print(f"  must_fix_trend:   {mf_history}  (non-degraded rounds only)")
     if project.human_checks_log_path.exists():
         print(f"  human_checks_log: {project.human_checks_log_path}")
     return 0

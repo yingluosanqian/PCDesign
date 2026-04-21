@@ -1,6 +1,7 @@
 """Project directory layout, metadata persistence, and append-only logs."""
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
@@ -78,6 +79,8 @@ class Project:
         judgment: dict,
         critics_output: dict,
         manually_edited: bool = False,
+        degraded: bool = False,
+        degraded_reasons: Optional[list[str]] = None,
     ) -> None:
         record = {
             "iteration": iteration,
@@ -85,6 +88,8 @@ class Project:
             "critics_output": critics_output,
             "judgment": judgment,
             "manually_edited": manually_edited,
+            "degraded": degraded,
+            "degraded_reasons": list(degraded_reasons or []),
         }
         self._append_jsonl(self.judgments_log_path, record)
 
@@ -95,6 +100,8 @@ class Project:
         critics_output: dict,
         judgment: dict,
         manually_edited: bool = False,
+        degraded: bool = False,
+        degraded_reasons: Optional[list[str]] = None,
     ) -> Path:
         """Explode one iteration into human-friendly files on disk.
 
@@ -122,6 +129,8 @@ class Project:
                 critics_output=critics_output,
                 judgment=judgment,
                 manually_edited=manually_edited,
+                degraded=degraded,
+                degraded_reasons=list(degraded_reasons or []),
             ),
             encoding="utf-8",
         )
@@ -140,10 +149,17 @@ class Project:
                     count += 1
         return count + 1
 
-    def must_fix_history(self) -> list[int]:
-        """must_fix counts across all logged iterations, in order."""
+    def must_fix_history(self, *, skip_degraded: bool = True) -> list[int]:
+        """must_fix counts across logged iterations, in order.
+
+        Degraded rounds (critic failure or Proposer no-op) are skipped by
+        default — they carry no trustworthy quality signal, and the
+        no-progress sliding window should only look at real rounds.
+        """
         out: list[int] = []
         for rec in self.iter_judgments():
+            if skip_degraded and rec.get("degraded"):
+                continue
             j = rec.get("judgment") or {}
             s = j.get("summary") or {}
             mf = s.get("must_fix_count")
@@ -177,6 +193,26 @@ class Project:
         for record in self.iter_judgments():
             last = record
         return last
+
+    def last_non_degraded_judgment(self) -> Optional[dict]:
+        """Most recent round whose judgment is trusted as stability evidence.
+
+        Degraded rounds (critic failure, Proposer no-op, or — once
+        implemented — claude-side contamination rollback) are skipped:
+        they either ran on incomplete input or didn't move the document.
+        """
+        last: Optional[dict] = None
+        for record in self.iter_judgments():
+            if record.get("degraded"):
+                continue
+            last = record
+        return last
+
+    def design_hash(self) -> Optional[str]:
+        """SHA-256 of design.md as a hex string, or None if the file is missing."""
+        if not self.design_path.exists():
+            return None
+        return hashlib.sha256(self.design_path.read_bytes()).hexdigest()
 
     @staticmethod
     def _append_jsonl(path: Path, record: Any) -> None:

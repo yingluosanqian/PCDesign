@@ -95,24 +95,61 @@ pcd check           <name> --result <confirm_stop|reopen|advisory_only> [--scope
 
 ### Convergence rule
 
-A round is considered converged when BOTH of the following hold:
+A round is considered converged when ALL of the following hold:
 
 1. **Quality suppression** (from the Judge's summary):
    - `must_fix_count == 0`, **and**
    - `should_fix_count <= 2`, **and**
    - no `high`-severity items among `must_fix`/`should_fix`.
-2. **Stability**: the previous round's `must_fix_count` is greater
-   than or equal to this round's (no rebound). Round 1 is therefore
-   never automatically converged — the comparison needs two data
-   points. Clean round-1 judgments skip the Proposer revise and wait
-   one more round for the stability signal.
+2. **Stability**: the **previous non-degraded round** also satisfied
+   quality suppression. Convergence therefore requires two consecutive
+   clean rounds — a single "lucky" round cannot declare convergence,
+   and the round before the current one must not be a no-op / failure
+   (see *Degraded rounds* below).
+3. **Not degraded**: the current round itself is non-degraded.
 
-`run-until-stop` exits on convergence, on `no progress` (two consecutive
-rounds without `must_fix` decreasing), or on `--max-iter`. If it exits
-via no-progress, use `pcd check` to record a human decision.
+Round 1 is therefore never automatically converged — there's no prior
+non-degraded round to compare against. Clean round-1 judgments skip
+the Proposer revise and wait one more round for the stability signal.
+
+`run-until-stop` exits on convergence, on `no progress` (three
+consecutive non-degraded rounds with non-decreasing `must_fix`), or on
+`--max-iter`. If it exits via no-progress, use `pcd check` to record a
+human decision.
 
 A single round can also be `confirm_stop`'d via `pcd check` at any
 time, which is how you turn a provisional stop into a confirmed one.
+
+### Degraded rounds
+
+A round is marked **degraded** when its quality signal is not trustworthy.
+Triggers:
+
+- **Critic failure**: one of the three critic subprocesses crashed or
+  produced unparseable output.
+- **Critic / Judge contamination**: under the claude backend, critics
+  and the Judge have filesystem write tools available (claude has no
+  read-only sandbox). If one of them modifies `design.md` during its
+  read-only run, PCDesign rolls `design.md` back from an in-memory
+  snapshot and marks the round degraded.
+- **Proposer no-op**: the Proposer's revise call finished but
+  `design.md` bytes were unchanged (the Proposer rejected every
+  `must_fix` and didn't edit anything). Without this check, the next
+  round's critics would run against the same text, so two consecutive
+  `quality_ok` rounds could sit on the same document — stability would
+  lose its meaning.
+
+Degraded rounds:
+
+- cannot declare convergence themselves, and
+- are skipped when a later round looks back for "previous round was
+  quality_ok", and
+- are skipped from the `must_fix`-trend sliding window used by
+  no-progress.
+
+They still appear in `.pcd/judgments.jsonl`, `.pcd/rounds/iter_NNN/`,
+and `pcd status` — tagged with `degraded: true` plus a `degraded_reasons`
+list explaining why.
 
 ### Example
 
