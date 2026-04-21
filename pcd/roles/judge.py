@@ -1,12 +1,12 @@
-"""Judge agent: ephemeral codex thread that merges critic issues into a package."""
+"""Judge agent: ephemeral agent thread that merges critic issues into a package."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from pcd.codex_client import CodexClient
+from pcd.agents import make_agent_client
 from pcd.issues import parse_judgment
-from pcd.prompts import judge_prompt
+from pcd.roles.prompts import judge_prompt
 
 
 def run_judge(
@@ -15,6 +15,8 @@ def run_judge(
     critics_output: dict,
     model: Optional[str],
     reasoning_effort: str = "medium",
+    agent: str = "codex",
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Run one fresh judge session. Returns a normalized judgment dict.
 
@@ -22,7 +24,8 @@ def run_judge(
     The Judge is given read-only access so it can ground decisions in
     the actual ./design.md.
     """
-    with CodexClient(
+    with make_agent_client(
+        agent,
         cwd=str(project_root),
         reasoning_effort=reasoning_effort,
     ) as client:
@@ -36,5 +39,6 @@ def run_judge(
             cwd=str(project_root),
             model=model,
             prompt=judge_prompt(critics_output),
+            on_progress=on_progress,
         )
     return parse_judgment(result.final_text)

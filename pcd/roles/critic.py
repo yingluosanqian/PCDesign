@@ -1,12 +1,12 @@
-"""Critic agents: ephemeral codex threads that review one section each."""
+"""Critic agents: ephemeral agent threads that review one section each."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from pcd.codex_client import CodexClient
+from pcd.agents import make_agent_client
 from pcd.issues import parse_critic_issues
-from pcd.prompts import (
+from pcd.roles.prompts import (
     design_critic_prompt,
     rationale_critic_prompt,
     requirement_critic_prompt,
@@ -36,11 +36,14 @@ def run_critic(
     project_root: Path,
     model: Optional[str],
     reasoning_effort: str = "medium",
+    agent: str = "codex",
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> list[dict]:
     """Run one fresh critic session for the given role; return parsed issues."""
     if role not in _PROMPT_BY_ROLE:
         raise ValueError(f"unknown critic role: {role!r}")
-    with CodexClient(
+    with make_agent_client(
+        agent,
         cwd=str(project_root),
         reasoning_effort=reasoning_effort,
     ) as client:
@@ -54,5 +57,6 @@ def run_critic(
             cwd=str(project_root),
             model=model,
             prompt=_PROMPT_BY_ROLE[role](),
+            on_progress=on_progress,
         )
     return parse_critic_issues(role, result.final_text)

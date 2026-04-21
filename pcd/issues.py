@@ -210,6 +210,90 @@ def no_progress(must_fix_history: list[int]) -> bool:
     return c >= b and b >= a and c > 0
 
 
+def format_round_summary(
+    iteration: int,
+    critics_output: dict,
+    judgment: dict,
+    manually_edited: bool = False,
+) -> str:
+    """Render one iteration — all three critics + the Judge's package — as
+    a single human-readable markdown document. Dropped onto disk at
+    `.pcd/rounds/iter_NNN/summary.md` next to the per-role JSON files."""
+    lines: list[str] = [f"# Iteration {iteration}"]
+    if manually_edited:
+        lines.append("")
+        lines.append(
+            "> Judge's package was manually edited via `--manual-judge` "
+            "before the Proposer consumed it."
+        )
+
+    for role, issues in critics_output.items():
+        lines.append("")
+        lines.append(f"## Critic: {role} ({len(issues)} issue(s))")
+        if not issues:
+            lines.append("")
+            lines.append("_No issues raised._")
+            continue
+        for it in issues:
+            sev = it.get("severity", "?")
+            rp = it.get("root_problem") or "unspecified"
+            lines.append("")
+            lines.append(f"- **[{sev}]** {rp}")
+            loc = it.get("location") or ""
+            if loc:
+                lines.append(f"    - location: {loc}")
+            ev = it.get("evidence") or ""
+            if ev:
+                lines.append(f"    - evidence: {ev}")
+            sd = it.get("suggested_direction") or ""
+            if sd:
+                lines.append(f"    - suggestion: {sd}")
+            iid = it.get("id") or ""
+            if iid:
+                lines.append(f"    - id: `{iid}`")
+
+    pkg = judgment.get("issue_package") or []
+    lines.append("")
+    lines.append(f"## Judge's package ({len(pkg)} cluster(s))")
+    for decision in VALID_DECISIONS:
+        items = [c for c in pkg if c.get("decision") == decision]
+        if not items:
+            continue
+        lines.append("")
+        lines.append(f"### {decision} ({len(items)})")
+        for c in items:
+            sev = c.get("severity", "?")
+            rp = c.get("root_problem") or "unspecified"
+            section = c.get("section") or "?"
+            lines.append("")
+            lines.append(f"- **[{sev}]** {rp} — section: {section}")
+            if c.get("suggested_direction"):
+                lines.append(f"    - suggestion: {c['suggested_direction']}")
+            if c.get("rationale"):
+                lines.append(f"    - judge rationale: {c['rationale']}")
+            if c.get("evidence_summary"):
+                lines.append(f"    - evidence: {c['evidence_summary']}")
+            if c.get("merged_issue_ids"):
+                lines.append(
+                    "    - source issues: "
+                    + ", ".join(c["merged_issue_ids"])
+                )
+
+    s = judgment.get("summary") or {}
+    lines.append("")
+    lines.append("## Summary")
+    for k in (
+        "must_fix_count",
+        "should_fix_count",
+        "reject_count",
+        "defer_count",
+        "high_severity_count",
+    ):
+        lines.append(f"- `{k}`: {s.get(k, 0)}")
+
+    return "\n".join(lines) + "\n"
+
+
 def format_issue_package_for_proposer(judgment: dict) -> str:
     """Render the Judge's issue package as markdown for inclusion in a prompt."""
     pkg = judgment.get("issue_package") or []

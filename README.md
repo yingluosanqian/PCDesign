@@ -13,11 +13,22 @@ design stops getting worse.
   single decision package with `must_fix / should_fix / reject / defer`.
 - Only the Judge's package is shown to P. P decides what to accept.
 
-All four roles run as [OpenAI codex][codex] subprocesses speaking JSON-RPC
-over stdio (`codex app-server --listen stdio://`). Different models can
-be assigned to P, the critics, and the Judge.
+Each role can run on either of two backend CLIs, picked per role at
+`init` time:
+
+- [OpenAI codex][codex] — a long-lived `codex app-server --listen
+  stdio://` subprocess speaking JSON-RPC.
+- [Anthropic Claude Code][claude] — one-shot `claude -p
+  --output-format stream-json` invocations. PCDesign always starts
+  Claude with `IS_SANDBOX=1` in the environment and
+  `--dangerously-skip-permissions` on the command line so the agent
+  has read/write access to the project directory.
+
+Different models and different agents can be assigned to P, the
+critics, and the Judge independently.
 
 [codex]: https://github.com/openai/codex
+[claude]: https://docs.claude.com/en/docs/claude-code/overview
 
 ## The design document
 
@@ -36,7 +47,8 @@ assumptions here.
 
 ## Install
 
-Requires Python ≥ 3.10 and the `codex` CLI on `$PATH`.
+Requires Python ≥ 3.10 and whichever agent CLIs you plan to use on
+`$PATH` (`codex`, `claude`, or both).
 
 ```bash
 pip install -e .
@@ -49,7 +61,10 @@ That installs a `pcd` script.
 ## CLI
 
 ```
-pcd init            <name> --prompt "…" [--proposer-model] [--critic-model] [--judge-model] [--reasoning medium]
+pcd init            <name> (--prompt "…" | --prompt-file <path>) \
+                           [--proposer-model] [--critic-model] [--judge-model] \
+                           [--agent codex|claude] [--proposer-agent] [--critic-agent] [--judge-agent] \
+                           [--reasoning medium]
 pcd run-once        <name> [--proposer-reasoning] [--critic-reasoning] [--judge-reasoning] [--manual-judge]
 pcd run-until-stop  <name> --max-iter K [--proposer-reasoning] [--critic-reasoning] [--judge-reasoning]
 pcd status          <name>
@@ -57,7 +72,10 @@ pcd check           <name> --result <confirm_stop|reopen|advisory_only> [--scope
 ```
 
 - **`init`** creates `./<name>/` with `design.md` (v0) and `.pcd/`
-  (metadata + logs).
+  (metadata + logs). Pass the initial requirement inline with
+  `--prompt "…"` (fine for one-liners) or from a file with
+  `--prompt-file <path>` (use `-` for stdin). The resolved prompt is
+  copied verbatim to `.pcd/initial_prompt.txt`.
 - **`run-once`** does exactly one round: 3 parallel critics → Judge →
   (if not converged) Proposer revises `design.md`. With
   `--manual-judge`, the Judge's package is opened in `$EDITOR` before
@@ -99,8 +117,11 @@ time, which is how you turn a provisional stop into a confirmed one.
 ### Example
 
 ```bash
-# 1. Start a new project at ./webcrawler/ from a one-line requirement.
+# 1a. Start a new project at ./webcrawler/ from a one-line requirement.
 pcd init webcrawler --prompt "Design a polite distributed web crawler that respects robots.txt and can resume after crashes."
+
+# 1b. Or, for longer briefs, load the requirement from a file.
+pcd init webcrawler --prompt-file ./requirements.md
 
 # 2. Run up to 5 iterations, stopping early on convergence or no-progress.
 pcd run-until-stop webcrawler --max-iter 5
@@ -132,14 +153,35 @@ pcd init myproj --prompt "..." \
   --judge-model   gpt-5-codex
 ```
 
-Any of the three can be omitted to use codex's default.
+Any of the three can be omitted to use the backend agent's default.
+
+### Per-role agents
+
+`--agent` picks a single backend (`codex` or `claude`) for all three
+roles; `--proposer-agent` / `--critic-agent` / `--judge-agent` override
+per role. The choice is stored in `.pcd/meta.json` alongside the
+models, and reused on subsequent `run-once` / `run-until-stop` calls.
+
+```bash
+# All three roles run on Claude.
+pcd init myproj --prompt "..." --agent claude
+
+# Mix: codex for the long-lived Proposer, claude for the ephemeral
+# critics and judge.
+pcd init myproj --prompt "..." --agent codex --critic-agent claude --judge-agent claude
+```
+
+Existing projects whose `meta.json` predates this feature fall through
+to `codex` for every role.
 
 ### Reasoning effort
 
-codex exposes a `model_reasoning_effort` knob (`low / medium / high`).
-The `--reasoning` flag on `init` controls it for the v0 pass; the three
-per-role flags on `run-once` / `run-until-stop` control it per role per
-round.
+The `--reasoning` flag on `init` and the three per-role flags on
+`run-once` / `run-until-stop` control reasoning effort per role per
+round. The knob maps to each backend's native control:
+
+- codex: `model_reasoning_effort` (`low | medium | high`)
+- claude: `--effort` (`low | medium | high | xhigh | max`)
 
 ## Project layout
 
@@ -152,22 +194,40 @@ round.
     judgments.jsonl         # append-only: critics' raw issues + Judge's package (with `manually_edited` flag)
     revisions.jsonl         # append-only: "revised" / "converged — no revise" / "quality ok, awaiting stability — no revise"
     human_checks.jsonl      # append-only: records from `pcd check`
+    rounds/                 # per-iteration breakout, written fresh each round
+      iter_001/
+        critic_requirement.json
+        critic_design.json
+        critic_rationale.json
+        judgment.json
+        summary.md          # one-page markdown rollup: all critics + judge package + counts
+      iter_002/
+        ...
 ```
 
+The `rounds/` tree is redundant with `judgments.jsonl` — same data,
+exploded per round and pretty-printed. It exists so you can `cat
+.pcd/rounds/iter_003/summary.md` (or open it in your editor) without
+having to dig a specific record out of the jsonl. `judgments.jsonl`
+remains the authoritative append-only log.
+
 `p_thread_id` in `meta.json` is what lets the Proposer's session survive
-across CLI invocations — codex's `thread/resume` reattaches to the same
-conversation.
+across CLI invocations — codex's `thread/resume` or claude's
+`--resume <uuid>` reattaches to the same conversation. The
+`proposer_agent` / `critic_agent` / `judge_agent` fields record which
+backend CLI drives each role.
 
 ## How a round actually runs
 
-1. **Three critics launch in parallel** (`ThreadPoolExecutor`, one codex
-   subprocess each, `sandbox=read-only`). Each is scoped to a single
+1. **Three critics launch in parallel** (`ThreadPoolExecutor`, one
+   agent subprocess each — codex uses `sandbox=read-only`; claude
+   always has full filesystem access). Each is scoped to a single
    section and returns a JSON array of issues.
-2. **Judge** (another codex subprocess, `read-only`) receives all the
-   critics' issues as JSON, re-reads `design.md`, merges duplicates,
-   assigns a *primary responsibility* when multiple critics hit the
-   same root problem (primary-failure-consequence rule), calibrates
-   severity, and emits a decision per cluster.
+2. **Judge** (another agent subprocess, read-only under codex)
+   receives all the critics' issues as JSON, re-reads `design.md`,
+   merges duplicates, assigns a *primary responsibility* when multiple
+   critics hit the same root problem (primary-failure-consequence
+   rule), calibrates severity, and emits a decision per cluster.
 3. **Optional manual gate.** With `--manual-judge`, the Judge's
    package is dumped to `.pcd/tmp_judgment_iter<N>.json` and opened
    in `$EDITOR`. The edited version is what gets logged and fed to
@@ -175,10 +235,13 @@ conversation.
 4. **Convergence check** = quality suppression × stability. If quality
    passes but stability doesn't (round 1 case), the round ends without
    a revise and waits one more round.
-5. **Otherwise Proposer revises** (`sandbox=workspace-write`): resumes
-   its long-lived thread, reads the Judge's package (rendered as
-   markdown, grouped by decision), decides what to accept, and
-   rewrites `design.md`.
+5. **Otherwise Proposer revises** (codex uses
+   `sandbox=workspace-write`; claude uses its standard
+   skip-permissions mode): resumes its long-lived thread, reads the
+   Judge's package (rendered as markdown, grouped by decision),
+   decides what to accept, and rewrites `design.md`. The thread is
+   identified by a UUID (`p_thread_id` in `meta.json`) that codex
+   reattaches via `thread/resume` and claude via `--resume <uuid>`.
 
 ## Design choices worth naming
 
@@ -215,5 +278,9 @@ conversation.
   `pip install -e . --no-build-isolation -v`.
 - **A run seems stuck** — `py-spy dump --pid <pid>` will show whether
   it's the orchestrator waiting on codex or a codex process itself.
-- **codex not found** — `pcd` requires the `codex` CLI on `$PATH`; see
+- **codex not found** — if any role is using the codex backend,
+  `pcd` requires the `codex` CLI on `$PATH`; see
   [openai/codex][codex] for install.
+- **claude not found** — if any role is using the claude backend,
+  `pcd` requires the `claude` CLI on `$PATH`; see
+  [Claude Code install][claude] for install.

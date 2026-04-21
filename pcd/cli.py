@@ -5,9 +5,10 @@ import argparse
 import sys
 from pathlib import Path
 
+from pcd.agents import SUPPORTED_AGENTS, normalize_agent
 from pcd.orchestrator import run_single_iteration, run_until_stop
 from pcd.project import Project, ProjectMeta
-from pcd.proposer import run_proposer_create
+from pcd.roles import run_proposer_create
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -21,13 +22,34 @@ def _build_parser() -> argparse.ArgumentParser:
         "init", help="Create a new design project and produce v0."
     )
     p_init.add_argument("project_name", help="Directory name for the new project.")
-    p_init.add_argument("--prompt", required=True, help="Initial user requirement.")
+    prompt_src = p_init.add_mutually_exclusive_group(required=True)
+    prompt_src.add_argument(
+        "--prompt",
+        help="Initial user requirement, passed inline. Convenient for short "
+        "one-liners; use --prompt-file for longer briefs.",
+    )
+    prompt_src.add_argument(
+        "--prompt-file",
+        help="Path to a file whose contents are used as the initial user "
+        "requirement. Use `-` to read from stdin.",
+    )
     p_init.add_argument("--proposer-model", default=None)
     p_init.add_argument("--critic-model", default=None)
     p_init.add_argument("--judge-model", default=None)
     p_init.add_argument(
         "--reasoning", default="medium", help="reasoning effort for the v0 pass"
     )
+    p_init.add_argument(
+        "--agent",
+        choices=SUPPORTED_AGENTS,
+        default="codex",
+        help="Default backend CLI for all roles (codex | claude). Stored in "
+        "meta.json and reused on subsequent run-once / run-until-stop calls. "
+        "Per-role overrides below take precedence.",
+    )
+    p_init.add_argument("--proposer-agent", choices=SUPPORTED_AGENTS, default=None)
+    p_init.add_argument("--critic-agent", choices=SUPPORTED_AGENTS, default=None)
+    p_init.add_argument("--judge-agent", choices=SUPPORTED_AGENTS, default=None)
 
     p_once = sub.add_parser(
         "run-once", help="Run exactly one critic+judge(+revise) iteration."
@@ -78,20 +100,57 @@ def _add_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--judge-reasoning", default="medium")
 
 
+def _resolve_initial_prompt(args: argparse.Namespace) -> str:
+    """Return the inline --prompt, or the contents of --prompt-file (or stdin)."""
+    if args.prompt is not None:
+        return args.prompt
+    path = args.prompt_file
+    if path == "-":
+        return sys.stdin.read()
+    return Path(path).read_text(encoding="utf-8")
+
+
+def _stderr_progress(s: str) -> None:
+    """Dump agent stream chunks to stderr verbatim, unbuffered.
+
+    Claude emits text blocks as-is (no newline between blocks) plus
+    `\\n[tool] ...\\n` markers for tool_use and `\\n[tool ✓]\\n` for
+    tool_result, so a plain write-through produces readable live output.
+    """
+    print(s, end="", file=sys.stderr, flush=True)
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     root = Path.cwd() / args.project_name
     project = Project(root)
     if root.exists():
         print(f"[pcd] error: {root} already exists", file=sys.stderr)
         return 1
-    project.create_layout(initial_prompt=args.prompt)
+    try:
+        prompt_text = _resolve_initial_prompt(args)
+    except (FileNotFoundError, OSError) as e:
+        print(f"[pcd] error: cannot read --prompt-file: {e}", file=sys.stderr)
+        return 1
+    if not prompt_text.strip():
+        print("[pcd] error: initial prompt is empty", file=sys.stderr)
+        return 1
+    proposer_agent = normalize_agent(args.proposer_agent or args.agent)
+    critic_agent = normalize_agent(args.critic_agent or args.agent)
+    judge_agent = normalize_agent(args.judge_agent or args.agent)
+    project.create_layout(initial_prompt=prompt_text)
     print(f"[pcd] created project at {project.root}", file=sys.stderr)
-    print("[pcd] proposer generating v0 …", file=sys.stderr, flush=True)
+    print(
+        f"[pcd] proposer generating v0 via {proposer_agent} …",
+        file=sys.stderr,
+        flush=True,
+    )
     thread_id = run_proposer_create(
         project_root=project.root,
-        user_prompt=args.prompt,
+        user_prompt=prompt_text,
         model=args.proposer_model,
         reasoning_effort=args.reasoning,
+        agent=proposer_agent,
+        on_progress=_stderr_progress,
     )
     project.save_meta(
         ProjectMeta(
@@ -101,6 +160,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
             judge_model=args.judge_model,
             created_at=Project.now_iso(),
             iterations_done=0,
+            proposer_agent=proposer_agent,
+            critic_agent=critic_agent,
+            judge_agent=judge_agent,
         )
     )
     if not project.design_path.exists():
@@ -131,6 +193,9 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
         proposer_reasoning=args.proposer_reasoning,
         critic_reasoning=args.critic_reasoning,
         judge_reasoning=args.judge_reasoning,
+        proposer_agent=meta.proposer_agent,
+        critic_agent=meta.critic_agent,
+        judge_agent=meta.judge_agent,
         manual_judge=args.manual_judge,
     )
     meta = project.load_meta()
@@ -156,6 +221,9 @@ def _cmd_run_until_stop(args: argparse.Namespace) -> int:
         proposer_reasoning=args.proposer_reasoning,
         critic_reasoning=args.critic_reasoning,
         judge_reasoning=args.judge_reasoning,
+        proposer_agent=meta.proposer_agent,
+        critic_agent=meta.critic_agent,
+        judge_agent=meta.judge_agent,
     )
     meta = project.load_meta()
     print(
@@ -176,6 +244,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"  proposer_model:   {meta.proposer_model}")
     print(f"  critic_model:     {meta.critic_model}")
     print(f"  judge_model:      {meta.judge_model}")
+    print(f"  proposer_agent:   {meta.proposer_agent}")
+    print(f"  critic_agent:     {meta.critic_agent}")
+    print(f"  judge_agent:      {meta.judge_agent}")
     print(f"  iterations_done:  {meta.iterations_done}")
     print(f"  converged:        {meta.converged}")
     if meta.convergence_note:

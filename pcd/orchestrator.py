@@ -6,9 +6,8 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Callable, Optional
 
-from pcd.critic import CRITIC_ROLES, run_critic
 from pcd.issues import (
     format_issue_package_for_proposer,
     is_converged,
@@ -16,9 +15,8 @@ from pcd.issues import (
     no_progress,
     parse_judgment,
 )
-from pcd.judge import run_judge
 from pcd.project import Project
-from pcd.proposer import run_proposer_revise
+from pcd.roles import CRITIC_ROLES, run_critic, run_judge, run_proposer_revise
 
 
 def run_single_iteration(
@@ -30,6 +28,9 @@ def run_single_iteration(
     proposer_reasoning: str = "medium",
     critic_reasoning: str = "medium",
     judge_reasoning: str = "medium",
+    proposer_agent: str = "codex",
+    critic_agent: str = "codex",
+    judge_agent: str = "codex",
     manual_judge: bool = False,
 ) -> dict:
     """One full round: 3 parallel critics -> judge -> (maybe) proposer revise.
@@ -60,6 +61,10 @@ def run_single_iteration(
                 project_root=project.root,
                 model=critic_model,
                 reasoning_effort=critic_reasoning,
+                agent=critic_agent,
+                on_progress=_make_role_progress(
+                    f"iter {iteration} critic:{role}"
+                ),
             ): role
             for role in CRITIC_ROLES
         }
@@ -86,6 +91,8 @@ def run_single_iteration(
         critics_output=critics_output,
         model=judge_model,
         reasoning_effort=judge_reasoning,
+        agent=judge_agent,
+        on_progress=_make_role_progress(f"iter {iteration} judge"),
     )
 
     manually_edited = False
@@ -100,6 +107,17 @@ def run_single_iteration(
         judgment=judgment,
         critics_output=critics_output,
         manually_edited=manually_edited,
+    )
+    round_dir = project.dump_round(
+        iteration=iteration,
+        critics_output=critics_output,
+        judgment=judgment,
+        manually_edited=manually_edited,
+    )
+    print(
+        f"[pcd] iter {iteration}: round artifacts at {round_dir}",
+        file=sys.stderr,
+        flush=True,
     )
 
     summary = judgment.get("summary") or {}
@@ -148,6 +166,8 @@ def run_single_iteration(
         issue_package_markdown=issue_package_md,
         model=proposer_model,
         reasoning_effort=proposer_reasoning,
+        agent=proposer_agent,
+        on_progress=_make_role_progress(f"iter {iteration} proposer"),
     )
     meta.iterations_done = iteration
     meta.converged = False
@@ -167,6 +187,9 @@ def run_until_stop(
     proposer_reasoning: str = "medium",
     critic_reasoning: str = "medium",
     judge_reasoning: str = "medium",
+    proposer_agent: str = "codex",
+    critic_agent: str = "codex",
+    judge_agent: str = "codex",
 ) -> None:
     """Loop run_single_iteration until convergence, no-progress, or max_iterations."""
     for _ in range(max_iterations):
@@ -178,6 +201,9 @@ def run_until_stop(
             proposer_reasoning=proposer_reasoning,
             critic_reasoning=critic_reasoning,
             judge_reasoning=judge_reasoning,
+            proposer_agent=proposer_agent,
+            critic_agent=critic_agent,
+            judge_agent=judge_agent,
         )
         if project.load_meta().converged:
             print("[pcd] converged; stopping loop", file=sys.stderr, flush=True)
@@ -199,6 +225,24 @@ def run_until_stop(
         file=sys.stderr,
         flush=True,
     )
+
+
+def _make_role_progress(role_label: str) -> Callable[[str], None]:
+    """Return a stderr printer that prefixes each tool event with `role_label`.
+
+    Plain text chunks (the agent's reasoning output) are dropped — during
+    an iteration they'd flood the terminal and interleave across the three
+    parallel critics. Tool-use markers (emitted by the client as
+    `\\n[tool] ...\\n` / `\\n[tool ✓]\\n`) survive and give a clean
+    per-role activity trace.
+    """
+    def progress(s: str) -> None:
+        if "[tool" not in s:
+            return
+        line = s.strip()
+        if line:
+            print(f"[{role_label}] {line}", file=sys.stderr, flush=True)
+    return progress
 
 
 def _describe_convergence(summary: dict, quality_ok: bool, stable: bool) -> str:

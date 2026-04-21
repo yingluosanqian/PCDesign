@@ -7,3 +7,7 @@ dist/
 build/
 .pytest_cache/
 .mypy_cache/
+
+# Generated pcd project dirs spawned inside dev/ (dev/README.md and
+# dev/*.md are still tracked — only subdirectories are ignored).
+dev/*/

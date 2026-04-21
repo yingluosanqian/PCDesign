@@ -15,6 +15,7 @@ INITIAL_PROMPT_FILENAME = "initial_prompt.txt"
 JUDGMENTS_LOG = "judgments.jsonl"
 REVISIONS_LOG = "revisions.jsonl"
 HUMAN_CHECKS_LOG = "human_checks.jsonl"
+ROUNDS_DIR = "rounds"
 
 
 @dataclass
@@ -27,6 +28,11 @@ class ProjectMeta:
     judge_model: Optional[str] = None
     converged: bool = False
     convergence_note: str = ""
+    # Per-role agent selection (codex | claude). Existing projects without
+    # these fields in meta.json fall through to the default "codex".
+    proposer_agent: str = "codex"
+    critic_agent: str = "codex"
+    judge_agent: str = "codex"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
@@ -49,6 +55,7 @@ class Project:
         self.judgments_log_path = self.meta_dir / JUDGMENTS_LOG
         self.revisions_log_path = self.meta_dir / REVISIONS_LOG
         self.human_checks_log_path = self.meta_dir / HUMAN_CHECKS_LOG
+        self.rounds_dir = self.meta_dir / ROUNDS_DIR
 
     def exists(self) -> bool:
         return self.meta_path.exists()
@@ -80,6 +87,45 @@ class Project:
             "manually_edited": manually_edited,
         }
         self._append_jsonl(self.judgments_log_path, record)
+
+    def dump_round(
+        self,
+        *,
+        iteration: int,
+        critics_output: dict,
+        judgment: dict,
+        manually_edited: bool = False,
+    ) -> Path:
+        """Explode one iteration into human-friendly files on disk.
+
+        Sibling to `append_judgment` (which owns the append-only jsonl log).
+        Lives under `.pcd/rounds/iter_NNN/` and is safe to re-write: calling
+        this twice for the same iteration just overwrites the files.
+        """
+        # Local import to avoid a project ← issues import cycle at module load.
+        from pcd.issues import format_round_summary
+
+        round_dir = self.rounds_dir / f"iter_{iteration:03d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        for role, issues in critics_output.items():
+            (round_dir / f"critic_{role}.json").write_text(
+                json.dumps(issues, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        (round_dir / "judgment.json").write_text(
+            json.dumps(judgment, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (round_dir / "summary.md").write_text(
+            format_round_summary(
+                iteration=iteration,
+                critics_output=critics_output,
+                judgment=judgment,
+                manually_edited=manually_edited,
+            ),
+            encoding="utf-8",
+        )
+        return round_dir
 
     def append_human_check(self, record: dict) -> None:
         self._append_jsonl(self.human_checks_log_path, record)
